@@ -24,7 +24,7 @@ use rocksdb::{DB, WriteBatch, Writable};
 use protobuf::{self, Message, MessageStatic};
 use uuid::Uuid;
 
-use kvproto::metapb;
+use kvproto::{metapb, errorpb};
 use kvproto::eraftpb::{self, ConfChangeType, MessageType};
 use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse, ChangePeerRequest, CmdType,
                           AdminCmdType, Request, Response, AdminRequest, AdminResponse,
@@ -36,6 +36,7 @@ use raftstore::{Result, Error};
 use raftstore::coprocessor::CoprocessorHost;
 use raftstore::coprocessor::split_observer::SplitObserver;
 use util::{escape, SlowTimer, rocksdb, clocktime};
+use util::codec::number::{NumberEncoder, NumberDecoder};
 use pd::{PdClient, INVALID_ID};
 use storage::{CF_LOCK, CF_RAFT};
 use super::store::Store;
@@ -52,6 +53,7 @@ use super::local_metrics::{RaftReadyMetrics, RaftMessageMetrics, RaftProposeMetr
 
 
 const TRANSFER_LEADER_ALLOW_LOG_LAG: u64 = 10;
+const PROPOSAL_BATCH_SIZE: usize = 64 * 1024; // 64k
 
 /// The returned states of the peer after checking whether it is stale
 #[derive(Debug)]
@@ -185,6 +187,44 @@ impl PendingCmdQueue {
     }
 }
 
+struct ProposalBatch {
+    data: Vec<u8>,
+    ctx: Vec<(PendingCmd, RaftCmdResponse)>,
+}
+
+struct PendingProposal {
+    proposals: Vec<ProposalBatch>,
+}
+
+impl PendingProposal {
+    fn new() -> PendingProposal {
+        PendingProposal { proposals: vec![] }
+    }
+
+    fn enqueue(&mut self, req: RaftCmdRequest, cmd: PendingCmd, err_resp: RaftCmdResponse) {
+        if self.proposals.last().map_or(true, |b| b.data.len() >= PROPOSAL_BATCH_SIZE) {
+            self.proposals.push(ProposalBatch {
+                data: vec![],
+                ctx: vec![],
+            });
+        }
+
+        let size = Message::compute_size(&req);
+        let batch = self.proposals.last_mut().unwrap();
+        batch.data.encode_var_u64(size as u64).unwrap();
+        req.write_to_vec(&mut batch.data).unwrap();
+        batch.ctx.push((cmd, err_resp));
+    }
+
+    fn read_req(mut buf: &[u8]) -> (&[u8], RaftCmdRequest) {
+        let size = buf.decode_var_u64().unwrap();
+        let mut req = RaftCmdRequest::new();
+        let (msg, left) = buf.split_at(size as usize);
+        req.merge_from_bytes(msg).unwrap();
+        (left, req)
+    }
+}
+
 /// Call the callback of `cmd` that the region is removed.
 fn notify_region_removed(region_id: u64, peer_id: u64, mut cmd: PendingCmd) {
     let region_not_found = Error::RegionNotFound(region_id);
@@ -220,6 +260,7 @@ pub struct Peer {
     region_id: u64,
     pub raft_group: RawNode<PeerStorage>,
     pending_cmds: PendingCmdQueue,
+    pending_proposal: PendingProposal,
     // Record the last instant of each peer's heartbeat response.
     pub peer_heartbeats: HashMap<u64, Instant>,
     coprocessor_host: CoprocessorHost,
@@ -321,6 +362,7 @@ impl Peer {
             region_id: region.get_id(),
             raft_group: raft_group,
             pending_cmds: Default::default(),
+            pending_proposal: PendingProposal::new(),
             peer_cache: store.peer_cache(),
             peer_heartbeats: HashMap::new(),
             coprocessor_host: CoprocessorHost::new(),
@@ -351,11 +393,6 @@ impl Peer {
         Ok(peer)
     }
 
-    #[inline]
-    fn next_proposal_index(&self) -> u64 {
-        self.raft_group.raft.raft_log.last_index() + 1
-    }
-
     pub fn destroy(&mut self) -> Result<()> {
         let t = Instant::now();
 
@@ -378,6 +415,11 @@ impl Peer {
         }
         if let Some(cmd) = self.pending_cmds.conf_change.take() {
             notify_region_removed(self.region_id, peer_id, cmd);
+        }
+        for ProposalBatch { ctx, .. } in self.pending_proposal.proposals.drain(..) {
+            for (cmd, _) in ctx {
+                notify_region_removed(self.region_id, peer_id, cmd);
+            }
         }
 
         if self.get_store().is_initialized() {
@@ -606,6 +648,8 @@ impl Peer {
     }
 
     pub fn handle_raft_ready_append<T: Transport>(&mut self, ctx: &mut ReadyContext<T>) {
+        self.flush_proposal();
+
         if self.mut_store().check_applying_snap() {
             // If we continue to handle all the messages, it may cause too many messages because
             // leader will send all the remaining messages to this follower, which can lead
@@ -775,14 +819,8 @@ impl Peer {
             // Try to renew leader lease on every conf change request.
             cmd.renew_lease_time = Some(clocktime::raw_now());
             self.pending_cmds.set_conf_change(cmd);
-        } else if let Err(e) = self.propose_normal(req, metrics) {
-            cmd_resp::bind_error(&mut err_resp, e);
-            cmd.call(err_resp);
-            return false;
         } else {
-            // Try to renew leader lease on every consistent read/write request.
-            cmd.renew_lease_time = Some(clocktime::raw_now());
-            self.pending_cmds.append_normal(cmd);
+            self.propose_normal(cmd, req, err_resp, metrics);
         }
 
         true
@@ -908,27 +946,19 @@ impl Peer {
     }
 
     fn propose_normal(&mut self,
-                      mut cmd: RaftCmdRequest,
-                      metrics: &mut RaftProposeMetrics)
-                      -> Result<()> {
+                      mut cmd: PendingCmd,
+                      mut req: RaftCmdRequest,
+                      mut err_resp: RaftCmdResponse,
+                      metrics: &mut RaftProposeMetrics) {
         metrics.normal += 1;
 
         // TODO: validate request for unexpected changes.
-        try!(self.coprocessor_host.pre_propose(&self.raft_group.get_store(), &mut cmd));
-        let data = try!(cmd.write_to_bytes());
-
-        // TODO: use local histogram metrics
-        PEER_PROPOSE_LOG_SIZE_HISTOGRAM.observe(data.len() as f64);
-
-        let propose_index = self.next_proposal_index();
-        try!(self.raft_group.propose(data));
-        if self.next_proposal_index() == propose_index {
-            // The message is dropped silently, this usually due to leader absence
-            // or transferring leader. Both cases can be considered as NotLeader error.
-            return Err(Error::NotLeader(self.region_id, None));
+        if let Err(e) = self.coprocessor_host.pre_propose(self.raft_group.get_store(), &mut req) {
+            cmd_resp::bind_error(&mut err_resp, e.into());
+            cmd.call(err_resp);
+            return;
         }
-
-        Ok(())
+        self.pending_proposal.enqueue(req, cmd, err_resp);
     }
 
     fn transfer_leader(&mut self, peer: &metapb::Peer) {
@@ -955,6 +985,52 @@ impl Peer {
         last_index <= status.progress[&peer_id].matched + TRANSFER_LEADER_ALLOW_LOG_LAG
     }
 
+    fn flush_proposal(&mut self) {
+        let is_leader = self.is_leader();
+        let leader = self.get_peer_from_cache(self.leader_id());
+        let term = self.term();
+        for ProposalBatch { data, ctx } in self.pending_proposal.proposals.drain(..) {
+            if data.is_empty() {
+                continue;
+            }
+            // TODO: use local histogram metrics
+            PEER_PROPOSE_LOG_SIZE_HISTOGRAM.observe(data.len() as f64);
+            let last_index = self.raft_group.raft.raft_log.last_index();
+            let err: Option<errorpb::Error> = if is_leader {
+                match self.raft_group.propose(data) {
+                    Ok(_) => {
+                        if self.raft_group.raft.raft_log.last_index() == last_index {
+                            // The message is dropped silently, this usually due to leader absence
+                            // or transferring leader. Both cases can be considered as NotLeader
+                            // error.
+                            Some(Error::NotLeader(self.region_id, leader.clone()).into())
+                        } else {
+                            None
+                        }
+                    }
+                    Err(e) => {
+                        let e: Error = e.into();
+                        Some(e.into())
+                    }
+                }
+            } else {
+                Some(Error::NotLeader(self.region_id, leader.clone()).into())
+            };
+            for (mut cmd, mut err_resp) in ctx {
+                if err.is_none() {
+                    cmd.term = term;
+                    // Try to renew leader lease on every consistent read/write request.
+                    // TODO: maybe we can only set the last `PendingCmd`.
+                    cmd.renew_lease_time = Some(clocktime::raw_now());
+                    self.pending_cmds.append_normal(cmd);
+                    continue;
+                }
+                err_resp.mut_header().set_error(err.clone().unwrap());
+                cmd.call(err_resp);
+            }
+        }
+    }
+
     fn propose_conf_change(&mut self,
                            cmd: RaftCmdRequest,
                            metrics: &mut RaftProposeMetrics)
@@ -964,6 +1040,9 @@ impl Peer {
         metrics.conf_change += 1;
 
         let data = try!(cmd.write_to_bytes());
+
+        // Before propose conf change, propose all pending normal proposal
+        self.flush_proposal();
 
         // TODO: use local histogram metrics
         PEER_PROPOSE_LOG_SIZE_HISTOGRAM.observe(data.len() as f64);
@@ -980,9 +1059,9 @@ impl Peer {
               cc.get_change_type(),
               cc.get_node_id());
 
-        let propose_index = self.next_proposal_index();
+        let last_index = self.raft_group.raft.raft_log.last_index();
         try!(self.raft_group.propose_conf_change(cc));
-        if self.next_proposal_index() == propose_index {
+        if self.raft_group.raft.raft_log.last_index() == last_index {
             // The message is dropped silently, this usually due to leader absence
             // or transferring leader. Both cases can be considered as NotLeader error.
             return Err(Error::NotLeader(self.region_id, None));
@@ -1166,9 +1245,7 @@ impl Peer {
                 eraftpb::EntryType::EntryConfChange => self.handle_raft_entry_conf_change(entry),
             };
 
-            if let Some(res) = res {
-                results.push(res);
-            }
+            results.extend(res);
         }
 
         slow_log!(t,
@@ -1178,14 +1255,21 @@ impl Peer {
         results
     }
 
-    fn handle_raft_entry_normal(&mut self, entry: &eraftpb::Entry) -> Option<ExecResult> {
+    fn handle_raft_entry_normal(&mut self, entry: &eraftpb::Entry) -> Vec<ExecResult> {
         let index = entry.get_index();
         let term = entry.get_term();
-        let data = entry.get_data();
+        let mut data = entry.get_data();
 
         if !data.is_empty() {
-            let cmd = parse_data_at(data, index, &self.tag);
-            return self.process_raft_cmd(index, term, cmd);
+            let mut res = vec![];
+            while !data.is_empty() {
+                let (left, cmd) = PendingProposal::read_req(data);
+                if let Some(exec_res) = self.process_raft_cmd(index, term, cmd) {
+                    res.push(exec_res);
+                }
+                data = left;
+            }
+            return res;
         }
 
         // when a peer become leader, it will send an empty entry.
@@ -1211,10 +1295,10 @@ impl Peer {
             // apprently, all the callbacks whose term is less than entry's term are stale.
             self.notify_stale_command(cmd);
         }
-        None
+        vec![]
     }
 
-    fn handle_raft_entry_conf_change(&mut self, entry: &eraftpb::Entry) -> Option<ExecResult> {
+    fn handle_raft_entry_conf_change(&mut self, entry: &eraftpb::Entry) -> Vec<ExecResult> {
         let index = entry.get_index();
         let term = entry.get_term();
         let conf_change: eraftpb::ConfChange = parse_data_at(entry.get_data(), index, &self.tag);
@@ -1226,7 +1310,7 @@ impl Peer {
         };
         self.raft_group.apply_conf_change(cc);
 
-        res
+        res.map_or_else(|| vec![], |r| vec![r])
     }
 
     fn find_cb(&mut self,
@@ -1397,6 +1481,11 @@ impl Peer {
         if let Some(mut cmd) = self.pending_cmds.conf_change.take() {
             info!("{} clear pending conf change", self.tag);
             cmd.cb.take();
+        }
+        for ProposalBatch { ctx, .. } in self.pending_proposal.proposals.drain(..) {
+            for (mut cmd, _) in ctx {
+                cmd.cb.take();
+            }
         }
     }
 }
