@@ -435,6 +435,11 @@ fn get_rocksdb_cf_option(config: &toml::Value,
                                              Some(32 * 1024 * 1024));
     opts.set_target_file_size_base(target_file_size_base as u64);
 
+    let dynamic_level_bytes = get_toml_boolean(config,
+                                               (prefix.clone() + "dynamic-level-bytes").as_str(),
+                                               Some(true));
+    opts.set_level_compaction_dynamic_level_bytes(dynamic_level_bytes);
+
     let level_zero_slowdown_writes_trigger =
         get_toml_int(config,
                      (prefix.clone() + "level0-slowdown-writes-trigger").as_str(),
