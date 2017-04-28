@@ -437,7 +437,7 @@ fn get_rocksdb_cf_option(config: &toml::Value,
 
     let dynamic_level_bytes = get_toml_boolean(config,
                                                (prefix.clone() + "dynamic-level-bytes").as_str(),
-                                               Some(true));
+                                               Some(false));
     opts.set_level_compaction_dynamic_level_bytes(dynamic_level_bytes);
 
     let level_zero_slowdown_writes_trigger =
