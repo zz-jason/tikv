@@ -272,6 +272,24 @@ stats-dump-period-sec = 600
 # during table initialization.
 # cache-index-and-filter-blocks = true
 
+# Compaction priority
+# 1) by-compensated-size:
+#   In Level-based compaction, it Determines which file from a level to
+#   be picked to merge to the next level. We suggest people try
+#   kMinOverlappingRatio first when you tune your database.
+# 2) oldest-largest-seq-first:
+#   First compact files whose data's latest update time is oldest.
+#   Try this if you only update some hot keys in small ranges.
+# 3) oldest-smallest-seq-first:
+#   First compact files whose range hasn't been compacted to the next level
+#   for the longest. If your updates are random across the key space,
+#   write amplification is slightly better with this option.
+# 4) min-overlapping-ratio:
+#   First compact files whose ratio between overlapping size in next level
+#   and its size is the smallest. It in many cases can optimize write
+#   amplification.
+# compaction-priority = "by-compensated-size"
+
 # Options for Column Family write
 # Column Family write used to store commit informations in MVCC model
 [rocksdb.writecf]

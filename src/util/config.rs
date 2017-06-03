@@ -18,7 +18,7 @@ use url;
 use regex::Regex;
 
 use util::collections::HashMap;
-use rocksdb::{DBCompressionType, DBRecoveryMode};
+use rocksdb::{DBCompressionType, DBRecoveryMode, CompactionPriority};
 
 quick_error! {
     #[derive(Debug)]
@@ -48,6 +48,16 @@ pub fn parse_rocksdb_compression(tp: &str) -> Result<DBCompressionType, ConfigEr
         "bzip2" => Ok(DBCompressionType::DBBz2),
         "lz4" => Ok(DBCompressionType::DBLz4),
         "lz4hc" => Ok(DBCompressionType::DBLz4hc),
+        _ => Err(ConfigError::RocksDB),
+    }
+}
+
+pub fn parse_rocksdb_compaction_priority(tp: &str) -> Result<CompactionPriority, ConfigError> {
+    match &*tp.to_lowercase() {
+        "by-compensated-size" => Ok(CompactionPriority::ByCompensatedSize),
+        "oldest-largest-seq-first" => Ok(CompactionPriority::OldestLargestSeqFirst),
+        "oldest-smallest-seq-first" => Ok(CompactionPriority::OldestSmallestSeqFirst),
+        "min-overlapping-ratio" => Ok(CompactionPriority::MinOverlappingRatio),
         _ => Err(ConfigError::RocksDB),
     }
 }

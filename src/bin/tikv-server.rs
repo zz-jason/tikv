@@ -407,6 +407,7 @@ struct CfOptValues {
     pub level_zero_file_num_compaction_trigger: i64,
     pub level_zero_slowdown_writes_trigger: i64,
     pub level_zero_stop_writes_trigger: i64,
+    pub compaction_priority: String,
 }
 
 impl Default for CfOptValues {
@@ -428,6 +429,7 @@ impl Default for CfOptValues {
             level_zero_file_num_compaction_trigger: 4,
             level_zero_slowdown_writes_trigger: 20,
             level_zero_stop_writes_trigger: 36,
+            compaction_priority: String::from("by-compensated-size"),
         }
     }
 }
@@ -475,6 +477,13 @@ fn get_rocksdb_cf_option(config: &toml::Value,
     let per_level_compression = util::config::parse_rocksdb_per_level_compression(&cpl)
         .unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
     opts.compression_per_level(&per_level_compression);
+
+    let compaction_pri = get_toml_string(config,
+                                         (prefix.clone() + "compaction-priority").as_str(),
+                                         Some(default_values.compaction_priority.clone()));
+    let pri = util::config::parse_rocksdb_compaction_priority(&compaction_pri)
+        .unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
+    opts.compaction_priority(pri);
 
     let write_buffer_size = get_toml_int(config,
                                          (prefix.clone() + "write-buffer-size").as_str(),
