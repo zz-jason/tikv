@@ -455,13 +455,6 @@ fn get_rocksdb_cf_option(config: &toml::Value,
                          Some(default_values.cache_index_and_filter_blocks));
     block_base_opts.set_cache_index_and_filter_blocks(cache_index_and_filter);
 
-    let cache_with_high_priority =
-        get_toml_boolean(config,
-                         (prefix.clone() + "cache-index-and-filter-blocks-with-high-priority")
-                             .as_str(),
-                         Some(default_values.cache_index_and_filter_blocks_with_high_priority));
-    block_base_opts.cache_index_and_filter_blocks_with_high_priority(cache_with_high_priority);
-
     if default_values.use_bloom_filter {
         let bloom_bits_per_key = get_toml_int(config,
                                               (prefix.clone() + "bloom-filter-bits-per-key")
