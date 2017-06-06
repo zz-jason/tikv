@@ -394,6 +394,7 @@ struct CfOptValues {
     pub block_size: i64,
     pub block_cache_size: i64,
     pub cache_index_and_filter_blocks: bool,
+    pub cache_index_and_filter_blocks_with_high_priority: bool,
     pub use_bloom_filter: bool,
     pub whole_key_filtering: bool,
     pub bloom_bits_per_key: i64,
@@ -415,6 +416,7 @@ impl Default for CfOptValues {
             block_size: 64 * KB as i64,
             block_cache_size: 256 * MB as i64,
             cache_index_and_filter_blocks: true,
+            cache_index_and_filter_blocks_with_high_priority: false,
             use_bloom_filter: false,
             whole_key_filtering: true,
             bloom_bits_per_key: 10,
@@ -452,6 +454,13 @@ fn get_rocksdb_cf_option(config: &toml::Value,
                          (prefix.clone() + "cache-index-and-filter-blocks").as_str(),
                          Some(default_values.cache_index_and_filter_blocks));
     block_base_opts.set_cache_index_and_filter_blocks(cache_index_and_filter);
+
+    let cache_with_high_priority =
+        get_toml_boolean(config,
+                         (prefix.clone() + "cache-index-and-filter-blocks-with-high-priority")
+                             .as_str(),
+                         Some(default_values.cache_index_and_filter_blocks_with_high_priority));
+    block_base_opts.cache_index_and_filter_blocks_with_high_priority(cache_with_high_priority);
 
     if default_values.use_bloom_filter {
         let bloom_bits_per_key = get_toml_int(config,
