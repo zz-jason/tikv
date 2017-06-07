@@ -302,7 +302,6 @@ impl Iterable for DB {
 impl Peekable for Snapshot {
     fn get_value(&self, key: &[u8]) -> Result<Option<DBVector>> {
         let mut opt = ReadOptions::new();
-        opt.set_total_order_seek(false);
         unsafe {
             opt.set_snapshot(&self.snap);
         }
@@ -313,7 +312,6 @@ impl Peekable for Snapshot {
     fn get_value_cf(&self, cf: &str, key: &[u8]) -> Result<Option<DBVector>> {
         let handle = try!(rocksdb::get_cf_handle(&self.db, cf));
         let mut opt = ReadOptions::new();
-        opt.set_total_order_seek(false);
         unsafe {
             opt.set_snapshot(&self.snap);
         }
