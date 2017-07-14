@@ -15,7 +15,7 @@ use std::fs;
 use std::path::Path;
 
 use storage::CF_DEFAULT;
-use rocksdb::{DB, Options, SliceTransform, DBCompressionType};
+use rocksdb::{DB, Options, BlobdbOptions, SliceTransform, DBCompressionType};
 use rocksdb::rocksdb::supported_compression;
 
 pub use rocksdb::CFHandle;
@@ -158,6 +158,44 @@ fn check_and_open(path: &str, mut db_opt: Options, cfs_opts: Vec<CFOptions>) -> 
 
 pub fn new_engine_opt(path: &str, opts: Options, cfs_opts: Vec<CFOptions>) -> Result<DB, String> {
     check_and_open(path, opts, cfs_opts)
+}
+
+pub fn new_blobdb_engine_opt(path: &str,
+                             mut db_opts: Options,
+                             blobdb_options: BlobdbOptions,
+                             cfs_opts: Vec<CFOptions>)
+                             -> Result<DB, String> {
+    // If db not exist, create it.
+    if !db_exist(path) {
+        db_opts.create_if_missing(true);
+
+        let mut cfs = vec![];
+        let mut cfs_opts_ref = vec![];
+        if let Some(x) = cfs_opts.iter().find(|x| x.cf == CF_DEFAULT) {
+            cfs.push(CF_DEFAULT);
+            cfs_opts_ref.push(&x.options);
+        }
+        let mut db = try!(DB::open_blobdb_cf(db_opts,
+                                             blobdb_options,
+                                             path,
+                                             cfs.as_slice(),
+                                             cfs_opts_ref.as_slice()));
+        for x in &cfs_opts {
+            if x.cf == CF_DEFAULT {
+                continue;
+            }
+            try!(db.create_cf(x.cf, &x.options));
+        }
+
+        return Ok(db);
+    }
+
+    db_opts.create_if_missing(false);
+    return DB::open_blobdb_cf(db_opts,
+                              blobdb_options,
+                              path,
+                              cfs.as_slice(),
+                              cfs_opts_ref.as_slice());
 }
 
 fn db_exist(path: &str) -> bool {

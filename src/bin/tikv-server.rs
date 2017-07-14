@@ -54,7 +54,7 @@ use std::time::Duration;
 use std::env;
 
 use clap::{Arg, App, ArgMatches};
-use rocksdb::{Options as RocksdbOptions, BlockBasedOptions};
+use rocksdb::{Options as RocksdbOptions, BlockBasedOptions, BlobdbOptions};
 use fs2::FileExt;
 use sys_info::{cpu_num, mem_info};
 
@@ -850,12 +850,13 @@ fn run_raft_server(pd_client: RpcClient,
                                           get_rocksdb_write_cf_option(config, total_mem)),
              rocksdb_util::CFOptions::new(CF_RAFT,
                                           get_rocksdb_raftlog_cf_option(config, total_mem))];
-    let engine = Arc::new(rocksdb_util::new_engine_opt(db_path.to_str()
-                                                           .unwrap(),
-                                                       db_opts,
-                                                       cfs_opts)
+    let blobdb_engine = Arc::new(rocksdb_util::new_blobdb_engine_opt(db_path.to_str()
+                                                                         .unwrap(),
+                                                                     db_opts,
+                                                                     BlobdbOptions::new(),
+                                                                     cfs_opts)
         .unwrap_or_else(|err| exit_with_err(format!("{:?}", err))));
-    let mut storage = create_raft_storage(raft_router.clone(), engine.clone(), &cfg)
+    let mut storage = create_raft_storage(raft_router.clone(), blobdb_engine.clone(), &cfg)
         .unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
 
     // Create pd client, snapshot manager, server.
@@ -877,7 +878,7 @@ fn run_raft_server(pd_client: RpcClient,
     // Create node.
     let mut node = Node::new(&mut event_loop, &cfg, pd_client);
     node.start(event_loop,
-               engine.clone(),
+               blobdb_engine.clone(),
                trans,
                snap_mgr,
                snap_status_receiver)
@@ -892,7 +893,7 @@ fn run_raft_server(pd_client: RpcClient,
 
     // Run server.
     server.start(&cfg).unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
-    signal_handler::handle_signal(engine, backup_path);
+    signal_handler::handle_signal(blobdb_engine, backup_path);
 
     // Stop.
     server.stop().unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
