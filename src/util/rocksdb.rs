@@ -191,11 +191,17 @@ pub fn new_blobdb_engine_opt(path: &str,
     }
 
     db_opts.create_if_missing(false);
-    return DB::open_blobdb_cf(db_opts,
-                              blobdb_options,
-                              path,
-                              cfs.as_slice(),
-                              cfs_opts_ref.as_slice());
+    let mut cfs = vec![];
+    let mut cfs_opts_ref = vec![];
+    for cf in &cfs_opts {
+        cfs.push(cf.cf);
+        cfs_opts_ref.push(&cf.options);
+    }
+    DB::open_blobdb_cf(db_opts,
+                       blobdb_options,
+                       path,
+                       cfs.as_slice(),
+                       cfs_opts_ref.as_slice())
 }
 
 fn db_exist(path: &str) -> bool {
