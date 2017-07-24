@@ -99,7 +99,8 @@ impl Simulator for ServerCluster {
         let (snap_status_sender, snap_status_receiver) = mpsc::channel();
 
         // Create storage.
-        let mut store = create_raft_storage(sim_router.clone(), engine.clone(), &cfg).unwrap();
+        let mut store =
+            create_raft_storage(sim_router.clone(), engine.clone(), engine.clone(), &cfg).unwrap();
         store.start(&cfg.storage).unwrap();
         self.storages.insert(node_id, store.get_engine());
 
@@ -123,7 +124,8 @@ impl Simulator for ServerCluster {
         // Create node.
         let mut node = Node::new(&mut event_loop, &cfg, self.pd_client.clone());
         node.start(event_loop,
-                   engine,
+                   engine.clone(),
+                   engine.clone(),
                    simulate_trans.clone(),
                    snap_mgr.clone(),
                    snap_status_receiver)

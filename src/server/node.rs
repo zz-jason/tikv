@@ -35,10 +35,14 @@ use super::transport::RaftStoreRouter;
 const MAX_CHECK_CLUSTER_BOOTSTRAPPED_RETRY_COUNT: u64 = 60;
 const CHECK_CLUSTER_BOOTSTRAPPED_RETRY_SECONDS: u64 = 3;
 
-pub fn create_raft_storage<S>(router: S, db: Arc<DB>, cfg: &Config) -> Result<Storage>
+pub fn create_raft_storage<S>(router: S,
+                              lsm_db: Arc<DB>,
+                              blob_db: Arc<DB>,
+                              cfg: &Config)
+                              -> Result<Storage>
     where S: RaftStoreRouter + 'static
 {
-    let engine = box RaftKv::new(db, router);
+    let engine = box RaftKv::new(lsm_db, blob_db, router);
     let store = try!(Storage::from_engine(engine, &cfg.storage));
     Ok(store)
 }
@@ -110,7 +114,8 @@ impl<C> Node<C>
 
     pub fn start<T>(&mut self,
                     event_loop: EventLoop<Store<T, C>>,
-                    engine: Arc<DB>,
+                    lsm_engine: Arc<DB>,
+                    blob_engine: Arc<DB>,
                     trans: T,
                     snap_mgr: SnapManager,
                     snap_status_receiver: Receiver<SnapshotStatusMsg>)
@@ -118,9 +123,9 @@ impl<C> Node<C>
         where T: Transport + 'static
     {
         let bootstrapped = try!(self.check_cluster_bootstrapped());
-        let mut store_id = try!(self.check_store(&engine));
+        let mut store_id = try!(self.check_store(&lsm_engine));
         if store_id == INVALID_ID {
-            store_id = try!(self.bootstrap_store(&engine));
+            store_id = try!(self.bootstrap_store(&lsm_engine));
         } else if !bootstrapped {
             // We have saved data before, and the cluster must be bootstrapped.
             return Err(box_err!("store {} is not empty, but cluster {} is not bootstrapped, \
@@ -131,12 +136,12 @@ impl<C> Node<C>
         }
 
         self.store.set_id(store_id);
-        try!(self.check_prepare_bootstrap_cluster(&engine));
+        try!(self.check_prepare_bootstrap_cluster(&lsm_engine));
         if !bootstrapped {
             // cluster is not bootstrapped, and we choose first store to bootstrap
             // prepare bootstrap.
-            let region = try!(self.prepare_bootstrap_cluster(&engine, store_id));
-            try!(self.bootstrap_cluster(&engine, region));
+            let region = try!(self.prepare_bootstrap_cluster(&lsm_engine, store_id));
+            try!(self.bootstrap_cluster(&lsm_engine, region));
         }
 
         // inform pd.
@@ -144,7 +149,8 @@ impl<C> Node<C>
             .put_store(self.store.clone()));
         try!(self.start_store(event_loop,
                               store_id,
-                              engine,
+                              lsm_engine,
+                              blob_engine,
                               trans,
                               snap_mgr,
                               snap_status_receiver));
@@ -275,7 +281,8 @@ impl<C> Node<C>
     fn start_store<T>(&mut self,
                       mut event_loop: EventLoop<Store<T, C>>,
                       store_id: u64,
-                      db: Arc<DB>,
+                      lsm_db: Arc<DB>,
+                      blob_db: Arc<DB>,
                       trans: T,
                       snap_mgr: SnapManager,
                       snapshot_status_receiver: Receiver<SnapshotStatusMsg>)
@@ -300,10 +307,11 @@ impl<C> Node<C>
                 sender: sender,
                 snapshot_status_receiver: snapshot_status_receiver,
             };
-            let mut store = match Store::new(ch, store, cfg, db, trans, pd_client, snap_mgr) {
-                Err(e) => panic!("construct store {} err {:?}", store_id, e),
-                Ok(s) => s,
-            };
+            let mut store =
+                match Store::new(ch, store, cfg, lsm_db, blob_db, trans, pd_client, snap_mgr) {
+                    Err(e) => panic!("construct store {} err {:?}", store_id, e),
+                    Ok(s) => s,
+                };
             tx.send(0).unwrap();
             if let Err(e) = store.run(&mut event_loop) {
                 error!("store {} run err {:?}", store_id, e);

@@ -192,7 +192,8 @@ pub struct PeerStat {
 }
 
 pub struct Peer {
-    engine: Arc<DB>,
+    lsm_engine: Arc<DB>,
+    blob_engine: Arc<DB>,
     cfg: Rc<Config>,
     peer_cache: RefCell<FlatMap<u64, metapb::Peer>>,
     pub peer: metapb::Peer,
@@ -293,7 +294,8 @@ impl Peer {
         let peer_cache = FlatMap::default();
         let tag = format!("[region {}] {}", region.get_id(), peer_id);
 
-        let ps = try!(PeerStorage::new(store.engine(),
+        let ps = try!(PeerStorage::new(store.lsm_engine(),
+                                       store.blob_engine(),
                                        region,
                                        sched,
                                        tag.clone(),
@@ -318,7 +320,8 @@ impl Peer {
         let raft_group = try!(RawNode::new(&raft_cfg, ps, &[]));
 
         let mut peer = Peer {
-            engine: store.engine(),
+            lsm_engine: store.lsm_engine(),
+            blob_engine: store.blob_engine(),
             peer: util::new_peer(store_id, peer_id),
             region_id: region.get_id(),
             raft_group: raft_group,
@@ -379,7 +382,7 @@ impl Peer {
         let mut wb = WriteBatch::new();
         try!(self.mut_store().clear_meta(&mut wb));
         try!(write_peer_state(&wb, &region, PeerState::Tombstone));
-        try!(self.engine.write(wb));
+        try!(self.lsm_engine.write(wb));
 
         if self.get_store().is_initialized() {
             // If we meet panic when deleting data and raft log, the dirty data
@@ -408,8 +411,12 @@ impl Peer {
         self.get_store().is_initialized()
     }
 
-    pub fn engine(&self) -> Arc<DB> {
-        self.engine.clone()
+    pub fn lsm_engine(&self) -> Arc<DB> {
+        self.lsm_engine.clone()
+    }
+
+    pub fn blob_engine(&self) -> Arc<DB> {
+        self.blob_engine.clone()
     }
 
     pub fn region(&self) -> &metapb::Region {
@@ -1517,14 +1524,17 @@ impl Peer {
 
     fn exec_read(&mut self, req: &RaftCmdRequest) -> Result<RaftCmdResponse> {
         try!(check_epoch(self.region(), req));
-        let snap = Snapshot::new(self.engine.clone());
+        let lsm_snap = Snapshot::new(self.lsm_engine.clone());
+        let blob_snap = Snapshot::new(self.blob_engine.clone());
         let requests = req.get_requests();
         let mut responses = Vec::with_capacity(requests.len());
 
         for req in requests {
             let cmd_type = req.get_cmd_type();
             let mut resp = match cmd_type {
-                CmdType::Get => try!(apply::do_get(&self.tag, self.region(), &snap, req)),
+                CmdType::Get => {
+                    try!(apply::do_get(&self.tag, self.region(), &lsm_snap, &blob_snap, req))
+                }
                 CmdType::Snap => try!(apply::do_snap(self.region().to_owned())),
                 CmdType::Prewrite => unreachable!(),
                 CmdType::Put | CmdType::Delete | CmdType::Invalid => unreachable!(),

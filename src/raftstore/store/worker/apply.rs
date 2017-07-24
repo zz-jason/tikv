@@ -29,7 +29,7 @@ use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse, ChangePeerRequest, Cm
 use util::worker::Runnable;
 use util::{SlowTimer, rocksdb, escape};
 use util::collections::{HashMap, HashMapEntry as MapEntry};
-use storage::{CF_LOCK, CF_RAFT};
+use storage::{CF_LOCK, CF_RAFT, CF_DEFAULT};
 use raftstore::{Result, Error};
 use raftstore::coprocessor::CoprocessorHost;
 use raftstore::store::{Store, cmd_resp, keys, util};
@@ -142,7 +142,8 @@ pub enum ExecResult {
 
 struct ApplyContext<'a> {
     pub host: &'a CoprocessorHost,
-    pub wb: Option<WriteBatch>,
+    pub lsm_wb: Option<WriteBatch>,
+    pub blob_wb: Option<WriteBatch>,
     pub cbs: Vec<(Callback, RaftCmdResponse)>,
     pub wb_last_bytes: u64,
     pub wb_last_keys: u64,
@@ -152,32 +153,41 @@ impl<'a> ApplyContext<'a> {
     fn new(host: &CoprocessorHost) -> ApplyContext {
         ApplyContext {
             host: host,
-            wb: Some(WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE)),
+            lsm_wb: Some(WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE)),
+            blob_wb: Some(WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE)),
             cbs: vec![],
             wb_last_bytes: 0,
             wb_last_keys: 0,
         }
     }
 
-    pub fn wb_mut(&mut self) -> &mut WriteBatch {
-        self.wb.as_mut().unwrap()
+    pub fn lsm_wb_mut(&mut self) -> &mut WriteBatch {
+        self.lsm_wb.as_mut().unwrap()
     }
 
-    pub fn wb_ref(&self) -> &WriteBatch {
-        self.wb.as_ref().unwrap()
+    pub fn lsm_wb_ref(&self) -> &WriteBatch {
+        self.lsm_wb.as_ref().unwrap()
+    }
+
+    pub fn blob_wb_mut(&mut self) -> &mut WriteBatch {
+        self.blob_wb.as_mut().unwrap()
+    }
+
+    pub fn blob_wb_ref(&self) -> &WriteBatch {
+        self.blob_wb.as_ref().unwrap()
     }
 
     pub fn mark_last_bytes_and_keys(&mut self) {
-        self.wb_last_bytes = self.wb_ref().data_size() as u64;
-        self.wb_last_keys = self.wb_ref().count() as u64;
+        self.wb_last_bytes = self.lsm_wb_ref().data_size() as u64;
+        self.wb_last_keys = self.lsm_wb_ref().count() as u64;
     }
 
     pub fn delta_bytes(&self) -> u64 {
-        self.wb_ref().data_size() as u64 - self.wb_last_bytes
+        self.lsm_wb_ref().data_size() as u64 - self.wb_last_bytes
     }
 
     pub fn delta_keys(&self) -> u64 {
-        self.wb_ref().count() as u64 - self.wb_last_keys
+        self.lsm_wb_ref().count() as u64 - self.wb_last_keys
     }
 }
 
@@ -240,7 +250,8 @@ pub struct ApplyDelegate {
     id: u64,
     // peer_tag, "[region region_id] peer_id"
     tag: String,
-    engine: Arc<DB>,
+    lsm_engine: Arc<DB>,
+    blob_engine: Arc<DB>,
     region: Region,
     // if we remove ourself in ChangePeer remove, we should set this flag, then
     // any following committed logs in same Ready should be applied failed.
@@ -263,14 +274,15 @@ impl ApplyDelegate {
 
     fn from_peer(peer: &Peer) -> ApplyDelegate {
         let reg = Registration::new(peer);
-        ApplyDelegate::from_registration(peer.engine(), reg)
+        ApplyDelegate::from_registration(peer.lsm_engine(), peer.blob_engine(), reg)
     }
 
-    fn from_registration(db: Arc<DB>, reg: Registration) -> ApplyDelegate {
+    fn from_registration(lsm_db: Arc<DB>, blob_db: Arc<DB>, reg: Registration) -> ApplyDelegate {
         ApplyDelegate {
             id: reg.id,
             tag: format!("[region {}] {}", reg.region.get_id(), reg.id),
-            engine: db,
+            lsm_engine: lsm_db,
+            blob_engine: blob_db,
             region: reg.region,
             pending_remove: false,
             apply_state: reg.apply_state,
@@ -319,7 +331,7 @@ impl ApplyDelegate {
         }
 
         if !self.pending_remove {
-            self.write_apply_state(apply_ctx.wb_mut());
+            self.write_apply_state(apply_ctx.lsm_wb_mut());
         }
 
         self.update_metrics(apply_ctx);
@@ -338,7 +350,7 @@ impl ApplyDelegate {
     }
 
     fn write_apply_state(&self, wb: &WriteBatch) {
-        rocksdb::get_cf_handle(&self.engine, CF_RAFT)
+        rocksdb::get_cf_handle(&self.lsm_engine, CF_RAFT)
             .map_err(From::from)
             .and_then(|handle| {
                 wb.put_msg_cf(handle,
@@ -363,23 +375,34 @@ impl ApplyDelegate {
         if !data.is_empty() {
             let cmd = parse_data_at(data, index, &self.tag);
 
-            if should_flush_to_engine(&cmd, apply_ctx.wb_ref().count()) {
-                self.write_apply_state(apply_ctx.wb_mut());
+            if should_flush_to_engine(&cmd,
+                                      apply_ctx.lsm_wb_ref().count() +
+                                      apply_ctx.blob_wb_ref().count()) {
+                self.write_apply_state(apply_ctx.lsm_wb_mut());
 
                 self.update_metrics(apply_ctx);
 
                 // flush to engine
-                self.engine
-                    .write(apply_ctx.wb.take().unwrap())
+                self.lsm_engine
+                    .write(apply_ctx.lsm_wb.take().unwrap())
                     .unwrap_or_else(|e| {
-                        panic!("{} failed to write to engine, error: {:?}", self.tag, e)
+                        panic!("{} failed to write to lsm engine, error: {:?}", self.tag, e)
+                    });
+
+                self.blob_engine
+                    .write(apply_ctx.blob_wb.take().unwrap())
+                    .unwrap_or_else(|e| {
+                        panic!("{} failed to write to blob engine, error: {:?}",
+                               self.tag,
+                               e)
                     });
 
                 // call callback
                 for (cb, resp) in apply_ctx.cbs.drain(..) {
                     cb(resp);
                 }
-                apply_ctx.wb = Some(WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE));
+                apply_ctx.lsm_wb = Some(WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE));
+                apply_ctx.blob_wb = Some(WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE));
                 apply_ctx.mark_last_bytes_and_keys();
             }
 
@@ -462,7 +485,11 @@ impl ApplyDelegate {
 
         let cmd_cb = self.find_cb(index, term, &cmd);
         apply_ctx.host.pre_apply(&self.region, &mut cmd);
-        let (mut resp, exec_result) = self.apply_raft_cmd(apply_ctx.wb_mut(), index, term, &cmd);
+        let (mut resp, exec_result) = self.apply_raft_cmd(apply_ctx.lsm_wb_ref(),
+                                                          apply_ctx.blob_wb_ref(),
+                                                          index,
+                                                          term,
+                                                          &cmd);
 
         debug!("{} applied command at log index {}", self.tag, index);
 
@@ -487,7 +514,8 @@ impl ApplyDelegate {
     // we should try to apply the entry again or panic. Considering that this
     // usually due to disk operation fail, which is rare, so just panic is ok.
     fn apply_raft_cmd(&mut self,
-                      wb: &mut WriteBatch,
+                      lsm_wb: &WriteBatch,
+                      blob_wb: &WriteBatch,
                       index: u64,
                       term: u64,
                       req: &RaftCmdRequest)
@@ -495,11 +523,13 @@ impl ApplyDelegate {
         // if pending remove, apply should be aborted already.
         assert!(!self.pending_remove);
 
-        let mut ctx = self.new_ctx(wb, index, term, req);
-        ctx.wb.set_save_point();
+        let mut ctx = self.new_ctx(lsm_wb, blob_wb, index, term, req);
+        //        ctx.lsm_wb.set_save_point();
+        //        ctx.blob_wb.set_save_point();
         let (resp, exec_result) = self.exec_raft_cmd(&mut ctx).unwrap_or_else(|e| {
             // clear dirty values.
-            ctx.wb.rollback_to_save_point().unwrap();
+            //            ctx.lsm_wb.rollback_to_save_point().unwrap();
+            //            ctx.blob_wb.rollback_to_save_point().unwrap();
             match e {
                 Error::StaleEpoch(..) => info!("{} stale epoch err: {:?}", self.tag, e),
                 _ => error!("{} execute raft command err: {:?}", self.tag, e),
@@ -573,14 +603,16 @@ impl ApplyDelegate {
     }
 
     fn new_ctx<'a>(&self,
-                   wb: &'a mut WriteBatch,
+                   lsm_wb: &'a WriteBatch,
+                   blob_wb: &'a WriteBatch,
                    index: u64,
                    term: u64,
                    req: &'a RaftCmdRequest)
                    -> ExecContext<'a> {
         ExecContext {
             apply_state: self.apply_state.clone(),
-            wb: wb,
+            lsm_wb: lsm_wb,
+            blob_wb: blob_wb,
             req: req,
             index: index,
             term: term,
@@ -590,7 +622,8 @@ impl ApplyDelegate {
 
 struct ExecContext<'a> {
     apply_state: RaftApplyState,
-    wb: &'a mut WriteBatch,
+    lsm_wb: &'a WriteBatch,
+    blob_wb: &'a WriteBatch,
     req: &'a RaftCmdRequest,
     index: u64,
     term: u64,
@@ -719,7 +752,7 @@ impl ApplyDelegate {
         } else {
             PeerState::Normal
         };
-        if let Err(e) = write_peer_state(ctx.wb, &region, state) {
+        if let Err(e) = write_peer_state(ctx.lsm_wb, &region, state) {
             panic!("{} failed to update region state: {:?}", self.tag, e);
         }
 
@@ -790,9 +823,11 @@ impl ApplyDelegate {
         let region_ver = region.get_region_epoch().get_version() + 1;
         region.mut_region_epoch().set_version(region_ver);
         new_region.mut_region_epoch().set_version(region_ver);
-        write_peer_state(ctx.wb, &region, PeerState::Normal)
-            .and_then(|_| write_peer_state(ctx.wb, &new_region, PeerState::Normal))
-            .and_then(|_| write_initial_state(self.engine.as_ref(), ctx.wb, new_region.get_id()))
+        write_peer_state(ctx.lsm_wb, &region, PeerState::Normal)
+            .and_then(|_| write_peer_state(ctx.lsm_wb, &new_region, PeerState::Normal))
+            .and_then(|_| {
+                write_initial_state(self.lsm_engine.as_ref(), ctx.lsm_wb, new_region.get_id())
+            })
             .unwrap_or_else(|e| {
                 panic!("{} failed to save split region {:?}: {:?}",
                        self.tag,
@@ -916,18 +951,31 @@ impl ApplyDelegate {
                 self.metrics.lock_cf_written_bytes += value.len() as u64;
             }
             // TODO: check whether cf exists or not.
-            rocksdb::get_cf_handle(&self.engine, cf)
-                .and_then(|handle| ctx.wb.put_cf(handle, &key, value))
-                .unwrap_or_else(|e| {
-                    panic!("{} failed to write ({}, {}) to cf {}: {:?}",
-                           self.tag,
-                           escape(&key),
-                           escape(value),
-                           cf,
-                           e)
-                });
+            if cf == CF_DEFAULT {
+                rocksdb::get_cf_handle(&self.blob_engine, cf)
+                    .and_then(|handle| ctx.blob_wb.put_cf(handle, &key, value))
+                    .unwrap_or_else(|e| {
+                        panic!("{} failed to write ({}, {}) to cf {}: {:?}",
+                               self.tag,
+                               escape(&key),
+                               escape(value),
+                               cf,
+                               e)
+                    });
+            } else {
+                rocksdb::get_cf_handle(&self.lsm_engine, cf)
+                    .and_then(|handle| ctx.lsm_wb.put_cf(handle, &key, value))
+                    .unwrap_or_else(|e| {
+                        panic!("{} failed to write ({}, {}) to cf {}: {:?}",
+                               self.tag,
+                               escape(&key),
+                               escape(value),
+                               cf,
+                               e)
+                    });
+            }
         } else {
-            ctx.wb.put(&key, value).unwrap_or_else(|e| {
+            ctx.blob_wb.put(&key, value).unwrap_or_else(|e| {
                 panic!("{} failed to write ({}, {}): {:?}",
                        self.tag,
                        escape(&key),
@@ -949,11 +997,19 @@ impl ApplyDelegate {
         if req.get_delete().has_cf() {
             let cf = req.get_delete().get_cf();
             // TODO: check whether cf exists or not.
-            rocksdb::get_cf_handle(&self.engine, cf)
-                .and_then(|handle| ctx.wb.delete_cf(handle, &key))
-                .unwrap_or_else(|e| {
-                    panic!("{} failed to delete {}: {:?}", self.tag, escape(&key), e)
-                });
+            if cf == CF_DEFAULT {
+                rocksdb::get_cf_handle(&self.blob_engine, cf)
+                    .and_then(|handle| ctx.blob_wb.delete_cf(handle, &key))
+                    .unwrap_or_else(|e| {
+                        panic!("{} failed to delete {}: {:?}", self.tag, escape(&key), e)
+                    });
+            } else {
+                rocksdb::get_cf_handle(&self.lsm_engine, cf)
+                    .and_then(|handle| ctx.lsm_wb.delete_cf(handle, &key))
+                    .unwrap_or_else(|e| {
+                        panic!("{} failed to delete {}: {:?}", self.tag, escape(&key), e)
+                    });
+            }
 
             if cf == CF_LOCK {
                 // delete is a kind of write for RocksDB.
@@ -962,7 +1018,7 @@ impl ApplyDelegate {
                 self.metrics.delete_keys_hint += 1;
             }
         } else {
-            ctx.wb.delete(&key).unwrap_or_else(|e| {
+            ctx.blob_wb.delete(&key).unwrap_or_else(|e| {
                 panic!("{} failed to delete {}: {:?}", self.tag, escape(&key), e)
             });
             self.metrics.delete_keys_hint += 1;
@@ -991,7 +1047,12 @@ fn check_data_key(key: &[u8], region: &Region) -> Result<()> {
     Ok(())
 }
 
-pub fn do_get(tag: &str, region: &Region, snap: &Snapshot, req: &Request) -> Result<Response> {
+pub fn do_get(tag: &str,
+              region: &Region,
+              lsm_snap: &Snapshot,
+              blob_snap: &Snapshot,
+              req: &Request)
+              -> Result<Response> {
     // TODO: the get_get looks wried, maybe we should figure out a better name later.
     let key = req.get_get().get_key();
     try!(check_data_key(key, region));
@@ -1000,15 +1061,25 @@ pub fn do_get(tag: &str, region: &Region, snap: &Snapshot, req: &Request) -> Res
     let res = if req.get_get().has_cf() {
         let cf = req.get_get().get_cf();
         // TODO: check whether cf exists or not.
-        snap.get_value_cf(cf, &keys::data_key(key)).unwrap_or_else(|e| {
-            panic!("{} failed to get {} with cf {}: {:?}",
-                   tag,
-                   escape(key),
-                   cf,
-                   e)
-        })
+        if cf == CF_DEFAULT {
+            blob_snap.get_value_cf(cf, &keys::data_key(key)).unwrap_or_else(|e| {
+                panic!("{} failed to get {} with cf {}: {:?}",
+                       tag,
+                       escape(key),
+                       cf,
+                       e)
+            })
+        } else {
+            lsm_snap.get_value_cf(cf, &keys::data_key(key)).unwrap_or_else(|e| {
+                panic!("{} failed to get {} with cf {}: {:?}",
+                       tag,
+                       escape(key),
+                       cf,
+                       e)
+            })
+        }
     } else {
-        snap.get_value(&keys::data_key(key))
+        blob_snap.get_value(&keys::data_key(key))
             .unwrap_or_else(|e| panic!("{} failed to get {}: {:?}", tag, escape(key), e))
     };
     if let Some(res) = res {
@@ -1039,7 +1110,7 @@ impl ApplyDelegate {
             // open files in rocksdb.
             // TODO: figure out another way to do consistency check without snapshot
             // or short life snapshot.
-            snap: Snapshot::new(self.engine.clone()),
+            snap: Snapshot::new(self.lsm_engine.clone()),
         })))
     }
 
@@ -1196,7 +1267,8 @@ pub enum TaskRes {
 
 // TODO: use threadpool to do task concurrently
 pub struct Runner {
-    db: Arc<DB>,
+    lsm_db: Arc<DB>,
+    blob_db: Arc<DB>,
     host: Arc<CoprocessorHost>,
     delegates: HashMap<u64, ApplyDelegate>,
     notifier: Sender<TaskRes>,
@@ -1209,7 +1281,8 @@ impl Runner {
             delegates.insert(region_id, ApplyDelegate::from_peer(p));
         }
         Runner {
-            db: store.engine(),
+            lsm_db: store.lsm_engine(),
+            blob_db: store.blob_engine(),
             host: store.coprocessor_host.clone(),
             delegates: delegates,
             notifier: notifier,
@@ -1256,9 +1329,12 @@ impl Runner {
         }
 
         // Write to engine
-        self.db
-            .write(apply_ctx.wb.take().unwrap())
-            .unwrap_or_else(|e| panic!("failed to write to engine, error: {:?}", e));
+        self.lsm_db
+            .write(apply_ctx.lsm_wb.take().unwrap())
+            .unwrap_or_else(|e| panic!("failed to write to lsm engine, error: {:?}", e));
+        self.blob_db
+            .write(apply_ctx.blob_wb.take().unwrap())
+            .unwrap_or_else(|e| panic!("failed to write to blob engine, error: {:?}", e));
 
         // Call callbacks
         for (cb, resp) in apply_ctx.cbs.drain(..) {
@@ -1304,7 +1380,8 @@ impl Runner {
         let peer_id = s.id;
         let region_id = s.region.get_id();
         let term = s.term;
-        let delegate = ApplyDelegate::from_registration(self.db.clone(), s);
+        let delegate =
+            ApplyDelegate::from_registration(self.lsm_db.clone(), self.blob_db.clone(), s);
         info!("{} register to apply delegates at term {}",
               delegate.tag,
               delegate.term);

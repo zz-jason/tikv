@@ -825,6 +825,7 @@ fn run_raft_server(pd_client: RpcClient,
     let store_path = Path::new(&cfg.storage.path);
     let lock_path = store_path.join(Path::new("LOCK"));
     let db_path = store_path.join(Path::new("db"));
+    let blob_path = store_path.join(Path::new("blob"));
     let snap_path = store_path.join(Path::new("snap"));
 
     let f = File::create(lock_path).unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
@@ -843,20 +844,28 @@ fn run_raft_server(pd_client: RpcClient,
     // Create engine, storage.
     let db_opts = get_rocksdb_db_option(config);
     let cfs_opts =
-        vec![rocksdb_util::CFOptions::new(CF_DEFAULT,
-                                          get_rocksdb_default_cf_option(config, total_mem)),
+        vec![rocksdb_util::CFOptions::new(CF_DEFAULT, RocksdbOptions::new()),
              rocksdb_util::CFOptions::new(CF_LOCK, get_rocksdb_lock_cf_option(config, total_mem)),
              rocksdb_util::CFOptions::new(CF_WRITE,
                                           get_rocksdb_write_cf_option(config, total_mem)),
              rocksdb_util::CFOptions::new(CF_RAFT,
                                           get_rocksdb_raftlog_cf_option(config, total_mem))];
-    let blobdb_engine = Arc::new(rocksdb_util::new_blobdb_engine_opt(db_path.to_str()
-                                                                         .unwrap(),
-                                                                     db_opts,
-                                                                     BlobdbOptions::new(),
-                                                                     cfs_opts)
+    let lsm_engine = Arc::new(rocksdb_util::new_engine_opt(db_path.to_str()
+                                                               .unwrap(),
+                                                           db_opts,
+                                                           cfs_opts)
         .unwrap_or_else(|err| exit_with_err(format!("{:?}", err))));
-    let mut storage = create_raft_storage(raft_router.clone(), blobdb_engine.clone(), &cfg)
+    let blob_cfs_opts = vec![rocksdb_util::CFOptions::new(CF_DEFAULT,
+                                          get_rocksdb_default_cf_option(config, total_mem))];
+    let blob_engine = Arc::new(rocksdb_util::new_blobdb_engine_opt(blob_path.to_str().unwrap(),
+                                                                   RocksdbOptions::new(),
+                                                                   BlobdbOptions::new(),
+                                                                   blob_cfs_opts)
+        .unwrap_or_else(|err| exit_with_err(format!("{:?}", err))));
+    let mut storage = create_raft_storage(raft_router.clone(),
+                                          lsm_engine.clone(),
+                                          blob_engine.clone(),
+                                          &cfg)
         .unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
 
     // Create pd client, snapshot manager, server.
@@ -878,7 +887,8 @@ fn run_raft_server(pd_client: RpcClient,
     // Create node.
     let mut node = Node::new(&mut event_loop, &cfg, pd_client);
     node.start(event_loop,
-               blobdb_engine.clone(),
+               lsm_engine.clone(),
+               blob_engine.clone(),
                trans,
                snap_mgr,
                snap_status_receiver)
@@ -893,7 +903,7 @@ fn run_raft_server(pd_client: RpcClient,
 
     // Run server.
     server.start(&cfg).unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
-    signal_handler::handle_signal(blobdb_engine, backup_path);
+    signal_handler::handle_signal(lsm_engine, backup_path);
 
     // Stop.
     server.stop().unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));

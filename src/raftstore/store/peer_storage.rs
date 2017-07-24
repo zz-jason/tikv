@@ -236,7 +236,8 @@ impl CacheQueryStats {
 }
 
 pub struct PeerStorage {
-    pub engine: Arc<DB>,
+    pub lsm_engine: Arc<DB>,
+    pub blob_engine: Arc<DB>,
 
     pub region: metapb::Region,
     pub raft_state: RaftLocalState,
@@ -377,19 +378,21 @@ fn init_last_term(engine: &DB,
 }
 
 impl PeerStorage {
-    pub fn new(engine: Arc<DB>,
+    pub fn new(lsm_engine: Arc<DB>,
+               blob_engine: Arc<DB>,
                region: &metapb::Region,
                region_sched: Scheduler<RegionTask>,
                tag: String,
                stats: Rc<RefCell<CacheQueryStats>>)
                -> Result<PeerStorage> {
-        debug!("creating storage on {} for {:?}", engine.path(), region);
-        let raft_state = try!(init_raft_state(&engine, region));
-        let apply_state = try!(init_apply_state(&engine, region));
-        let last_term = try!(init_last_term(&engine, region, &raft_state, &apply_state));
+        debug!("creating storage on {} for {:?}", lsm_engine.path(), region);
+        let raft_state = try!(init_raft_state(&lsm_engine, region));
+        let apply_state = try!(init_apply_state(&lsm_engine, region));
+        let last_term = try!(init_last_term(&lsm_engine, region, &raft_state, &apply_state));
 
         Ok(PeerStorage {
-            engine: engine,
+            lsm_engine: lsm_engine,
+            blob_engine: blob_engine,
             region: region.clone(),
             raft_state: raft_state,
             apply_state: apply_state,
@@ -490,10 +493,10 @@ impl PeerStorage {
         if high - low <= RAFT_LOG_MULTI_GET_CNT {
             // If election happens in inactive regions, they will just try
             // to fetch one empty log.
-            let handle = self.engine.cf_handle(CF_RAFT).unwrap();
+            let handle = self.lsm_engine.cf_handle(CF_RAFT).unwrap();
             for i in low..high {
                 let key = keys::raft_log_key(self.get_region_id(), i);
-                match box_try!(self.engine.get_cf(handle, &key)) {
+                match box_try!(self.lsm_engine.get_cf(handle, &key)) {
                     None => return Err(RaftError::Store(StorageError::Unavailable)),
                     Some(v) => {
                         let mut entry = Entry::new();
@@ -514,11 +517,11 @@ impl PeerStorage {
 
         let start_key = keys::raft_log_key(self.get_region_id(), low);
         let end_key = keys::raft_log_key(self.get_region_id(), high);
-        try!(self.engine.scan_cf(CF_RAFT,
-                                 &start_key,
-                                 &end_key,
-                                 true, // fill_cache
-                                 &mut |_, value| {
+        try!(self.lsm_engine.scan_cf(CF_RAFT,
+                                     &start_key,
+                                     &end_key,
+                                     true, // fill_cache
+                                     &mut |_, value| {
             let mut entry = Entry::new();
             try!(entry.merge_from_bytes(value));
 
@@ -593,7 +596,11 @@ impl PeerStorage {
     }
 
     pub fn raw_snapshot(&self) -> DbSnapshot {
-        DbSnapshot::new(self.engine.clone())
+        DbSnapshot::new(self.lsm_engine.clone())
+    }
+
+    pub fn raw_blob_snapshot(&self) -> DbSnapshot {
+        DbSnapshot::new(self.blob_engine.clone())
     }
 
     fn validate_snap(&self, snap: &Snapshot) -> bool {
@@ -711,7 +718,7 @@ impl PeerStorage {
             (e.get_index(), e.get_term())
         };
 
-        let handle = try!(rocksdb::get_cf_handle(&self.engine, CF_RAFT));
+        let handle = try!(rocksdb::get_cf_handle(&self.lsm_engine, CF_RAFT));
         for entry in entries {
             try!(wb.put_msg_cf(handle,
                                &keys::raft_log_key(self.get_region_id(), entry.get_index()),
@@ -782,7 +789,7 @@ impl PeerStorage {
 
     /// Delete all meta belong to the region. Results are stored in `wb`.
     pub fn clear_meta(&mut self, wb: &mut WriteBatch) -> Result<()> {
-        try!(clear_meta(&self.engine, wb, self.get_region_id()));
+        try!(clear_meta(&self.lsm_engine, wb, self.get_region_id()));
         self.cache = EntryCache::default();
         Ok(())
     }
@@ -814,8 +821,12 @@ impl PeerStorage {
         Ok(())
     }
 
-    pub fn get_engine(&self) -> Arc<DB> {
-        self.engine.clone()
+    pub fn get_lsm_engine(&self) -> Arc<DB> {
+        self.lsm_engine.clone()
+    }
+
+    pub fn get_blob_engine(&self) -> Arc<DB> {
+        self.blob_engine.clone()
     }
 
     /// Check whether the storage has finished applying snapshot.
@@ -943,11 +954,11 @@ impl PeerStorage {
         }
 
         if ctx.raft_state != self.raft_state {
-            try!(ctx.save_raft_to(&self.engine, &mut ready_ctx.wb));
+            try!(ctx.save_raft_to(&self.lsm_engine, &mut ready_ctx.wb));
         }
 
         if ctx.apply_state != self.apply_state {
-            try!(ctx.save_apply_to(&self.engine, &mut ready_ctx.wb));
+            try!(ctx.save_apply_to(&self.lsm_engine, &mut ready_ctx.wb));
         }
 
         Ok(ctx)
@@ -988,33 +999,33 @@ impl PeerStorage {
 }
 
 /// Delete all meta belong to the region. Results are stored in `wb`.
-pub fn clear_meta(engine: &DB, wb: &WriteBatch, region_id: u64) -> Result<()> {
+pub fn clear_meta(lsm_engine: &DB, wb: &WriteBatch, region_id: u64) -> Result<()> {
     let t = Instant::now();
     let mut meta_count = 0;
     let mut raft_count = 0;
     let (meta_start, meta_end) = (keys::region_meta_prefix(region_id),
                                   keys::region_meta_prefix(region_id + 1));
-    try!(engine.scan(&meta_start,
-                     &meta_end,
-                     false,
-                     &mut |key, _| {
-                         try!(wb.delete(key));
-                         meta_count += 1;
-                         Ok(true)
-                     }));
+    try!(lsm_engine.scan(&meta_start,
+                         &meta_end,
+                         false,
+                         &mut |key, _| {
+                             try!(wb.delete(key));
+                             meta_count += 1;
+                             Ok(true)
+                         }));
 
-    let handle = try!(rocksdb::get_cf_handle(engine, CF_RAFT));
+    let handle = try!(rocksdb::get_cf_handle(lsm_engine, CF_RAFT));
     let (raft_start, raft_end) = (keys::region_raft_prefix(region_id),
                                   keys::region_raft_prefix(region_id + 1));
-    try!(engine.scan_cf(CF_RAFT,
-                        &raft_start,
-                        &raft_end,
-                        false,
-                        &mut |key, _| {
-                            try!(wb.delete_cf(handle, key));
-                            raft_count += 1;
-                            Ok(true)
-                        }));
+    try!(lsm_engine.scan_cf(CF_RAFT,
+                            &raft_start,
+                            &raft_end,
+                            false,
+                            &mut |key, _| {
+                                try!(wb.delete_cf(handle, key));
+                                raft_count += 1;
+                                Ok(true)
+                            }));
     info!("[region {}] clear peer {} meta keys and {} raft keys, takes {:?}",
           region_id,
           meta_count,

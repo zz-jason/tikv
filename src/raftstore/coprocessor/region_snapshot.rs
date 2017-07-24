@@ -18,34 +18,38 @@ use kvproto::metapb::Region;
 use raftstore::store::engine::{SyncSnapshot, Snapshot, Peekable, Iterable, IterOption};
 use raftstore::store::{keys, util, PeerStorage};
 use raftstore::Result;
-
+use storage::CF_DEFAULT;
 
 /// Snapshot of a region.
 ///
 /// Only data within a region can be accessed.
 pub struct RegionSnapshot {
-    snap: SyncSnapshot,
+    lsm_snap: SyncSnapshot,
+    blob_snap: SyncSnapshot,
     region: Arc<Region>,
 }
 
 impl RegionSnapshot {
     pub fn new(ps: &PeerStorage) -> RegionSnapshot {
         RegionSnapshot {
-            snap: ps.raw_snapshot().into_sync(),
+            lsm_snap: ps.raw_snapshot().into_sync(),
+            blob_snap: ps.raw_blob_snapshot().into_sync(),
             region: Arc::new(ps.get_region().clone()),
         }
     }
 
-    pub fn from_raw(db: Arc<DB>, region: Region) -> RegionSnapshot {
+    pub fn from_raw(lsm_db: Arc<DB>, blob_db: Arc<DB>, region: Region) -> RegionSnapshot {
         RegionSnapshot {
-            snap: Snapshot::new(db).into_sync(),
+            lsm_snap: Snapshot::new(lsm_db).into_sync(),
+            blob_snap: Snapshot::new(blob_db).into_sync(),
             region: Arc::new(region),
         }
     }
 
     pub fn clone(&self) -> RegionSnapshot {
         RegionSnapshot {
-            snap: self.snap.clone(),
+            lsm_snap: self.lsm_snap.clone(),
+            blob_snap: self.blob_snap.clone(),
             region: self.region.clone(),
         }
     }
@@ -55,11 +59,15 @@ impl RegionSnapshot {
     }
 
     pub fn iter(&self, iter_opt: IterOption) -> RegionIterator {
-        RegionIterator::new(&self.snap, self.region.clone(), iter_opt)
+        RegionIterator::new(&self.blob_snap, self.region.clone(), iter_opt)
     }
 
     pub fn iter_cf(&self, cf: &str, iter_opt: IterOption) -> Result<RegionIterator> {
-        Ok(RegionIterator::new_cf(&self.snap, self.region.clone(), iter_opt, cf))
+        if cf == CF_DEFAULT {
+            Ok(RegionIterator::new_cf(&self.blob_snap, self.region.clone(), iter_opt, cf))
+        } else {
+            Ok(RegionIterator::new_cf(&self.lsm_snap, self.region.clone(), iter_opt, cf))
+        }
     }
 
     // scan scans database using an iterator in range [start_key, end_key), calls function f for
@@ -120,13 +128,17 @@ impl Peekable for RegionSnapshot {
     fn get_value(&self, key: &[u8]) -> Result<Option<DBVector>> {
         try!(util::check_key_in_region(key, &self.region));
         let data_key = keys::data_key(key);
-        self.snap.get_value(&data_key)
+        self.blob_snap.get_value(&data_key)
     }
 
     fn get_value_cf(&self, cf: &str, key: &[u8]) -> Result<Option<DBVector>> {
         try!(util::check_key_in_region(key, &self.region));
         let data_key = keys::data_key(key);
-        self.snap.get_value_cf(cf, &data_key)
+        if cf == CF_DEFAULT {
+            self.blob_snap.get_value_cf(cf, &data_key)
+        } else {
+            self.lsm_snap.get_value_cf(cf, &data_key)
+        }
     }
 }
 

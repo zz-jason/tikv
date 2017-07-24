@@ -112,7 +112,8 @@ impl From<RaftServerError> for engine::Error {
 /// `RaftKv` is a storage engine base on `RaftStore`.
 #[derive(Clone)]
 pub struct RaftKv<S: RaftStoreRouter + 'static> {
-    db: Arc<DB>,
+    lsm_db: Arc<DB>,
+    blob_db: Arc<DB>,
     router: S,
 }
 
@@ -123,7 +124,8 @@ enum CmdRes {
 
 fn on_result(mut resp: RaftCmdResponse,
              resp_cnt: usize,
-             db: Arc<DB>)
+             lsm_db: Arc<DB>,
+             blob_db: Arc<DB>)
              -> (CbContext, Result<CmdRes>) {
     let mut cb_ctx = CbContext::new();
     cb_ctx.term = Some(resp.get_header().get_current_term());
@@ -141,25 +143,27 @@ fn on_result(mut resp: RaftCmdResponse,
     if resps.len() != 1 || resps[0].get_cmd_type() != CmdType::Snap {
         return (cb_ctx, Ok(CmdRes::Resp(resps.into_vec())));
     }
-    let snap = RegionSnapshot::from_raw(db, resps[0].take_snap().take_region());
+    let snap = RegionSnapshot::from_raw(lsm_db, blob_db, resps[0].take_snap().take_region());
     (cb_ctx, Ok(CmdRes::Snap(snap)))
 }
 
 impl<S: RaftStoreRouter> RaftKv<S> {
     /// Create a RaftKv using specified configuration.
-    pub fn new(db: Arc<DB>, router: S) -> RaftKv<S> {
+    pub fn new(lsm_db: Arc<DB>, blob_db: Arc<DB>, router: S) -> RaftKv<S> {
         RaftKv {
-            db: db,
+            lsm_db: lsm_db,
+            blob_db: blob_db,
             router: router,
         }
     }
 
     fn call_command(&self, req: RaftCmdRequest, cb: Callback<CmdRes>) -> Result<()> {
         let l = req.get_requests().len();
-        let db = self.db.clone();
+        let lsm_db = self.lsm_db.clone();
+        let blob_db = self.blob_db.clone();
         try!(self.router.send_command(req,
                                       box move |resp| {
-                                          let (cb_ctx, res) = on_result(resp, l, db);
+                                          let (cb_ctx, res) = on_result(resp, l, lsm_db, blob_db);
                                           cb((cb_ctx, res.map_err(Error::into)));
                                       }));
         Ok(())
@@ -295,7 +299,9 @@ impl<S: RaftStoreRouter> Engine for RaftKv<S> {
     }
 
     fn clone(&self) -> Box<Engine> {
-        box RaftKv::new(self.db.clone(), self.router.clone())
+        box RaftKv::new(self.lsm_db.clone(),
+                        self.blob_db.clone(),
+                        self.router.clone())
     }
 }
 
