@@ -431,6 +431,11 @@ fn get_rocksdb_db_option(config: &toml::Value) -> DBOptions {
     let pipelined_write = get_toml_boolean(config, "rocksdb.enable-pipelined-write", Some(true));
     opts.enable_pipelined_write(pipelined_write);
 
+    let paths = get_toml_string(config, "rocksdb.db-paths", Some(":0".to_owned()));
+    let db_paths = util::config::parse_rocksdb_db_paths(paths)
+        .unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
+    opts.set_db_paths(db_paths.as_slice());
+
     opts
 }
 

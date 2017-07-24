@@ -295,6 +295,11 @@ stats-dump-period-sec = 600
 # during table initialization.
 # cache-index-and-filter-blocks = true
 
+# A list of paths where SST files can be put into, with its target size.
+# Newer data is placed into paths specified earlier while older data
+# gradually moves to paths specified later.
+db-path = "/flash_path:100MB,/hard_drive:1GB"
+
 # Options for Column Family write
 # Column Family write used to store commit informations in MVCC model
 [rocksdb.writecf]

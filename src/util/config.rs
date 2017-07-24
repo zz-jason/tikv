@@ -10,12 +10,12 @@
 // distributed under the License is distributed on an "AS IS" BASIS,
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
+extern crate toml;
 use std::str::FromStr;
 use std::net::{SocketAddrV4, SocketAddrV6};
-
 use url;
 use regex::Regex;
+use std::path::PathBuf;
 
 use util::collections::HashMap;
 use rocksdb::{DBCompressionType, DBRecoveryMode, CompactionPriority};
@@ -80,6 +80,16 @@ pub fn parse_rocksdb_compaction_pri(priority: i64) -> Result<CompactionPriority,
         3 => Ok(CompactionPriority::MinOverlappingRatio),
         _ => Err(ConfigError::Value(format!("invalid Compaction priority: {:?}", priority))),
     }
+}
+
+pub fn parse_rocksdb_db_paths(paths: String) -> Result<Vec<(PathBuf, u64)>, ConfigError> {
+    let mut path_vec = vec![];
+    let path_str: Vec<&str> = paths.split(',').collect();
+    for p in path_str {
+        let p_vec: Vec<&str> = p.split(':').collect();
+        path_vec.push((PathBuf::from(p_vec[0]), parse_readable_int(p_vec[1]).unwrap() as u64));
+    }
+    Ok(path_vec)
 }
 
 fn split_property(property: &str) -> Result<(f64, &str), ConfigError> {
@@ -404,6 +414,14 @@ mod test {
                 parse_rocksdb_compaction_pri(3).unwrap());
 
         assert!(parse_rocksdb_compaction_pri(4).is_err());
+    }
+
+    #[test]
+    fn test_parse_rocksdb_db_paths() {
+        let paths = parse_rocksdb_db_paths("/flash_path:10GB,/hard_drive:2TB".to_string()).unwrap();
+        assert_eq!(paths.as_slice(),
+                   &[(PathBuf::from("/flash_path"), 10 * GB as u64),
+                     (PathBuf::from("/hard_drive"), 2 * TB as u64)]);
     }
 
     #[cfg(target_os = "linux")]
