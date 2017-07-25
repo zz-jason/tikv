@@ -388,6 +388,9 @@ fn get_rocksdb_db_option(config: &toml::Value) -> RocksdbOptions {
                                      Some(false));
     opts.set_use_direct_io_for_flush_and_compaction(direct_io);
 
+    let pipelined_write = get_toml_boolean(config, "rocksdb.enable-pipelined-write", Some(true));
+    opts.enable_pipelined_write(pipelined_write);
+
     opts
 }
 
@@ -810,13 +813,13 @@ fn get_data_and_backup_dirs(matches: &ArgMatches, config: &toml::Value) -> (Stri
     }
 }
 
-fn get_raft_rocksdb_data_dir(store_dir: &String, config: &toml::Value) -> String {
+fn get_raft_rocksdb_data_dir(store_dir: &str, config: &toml::Value) -> String {
     // raft rocksdb data path
     let abs_data_dir = get_toml_string_opt(config, "server.raft-data-dir")
         .map(|s| canonicalize_path(&s))
         .unwrap_or_else(|| {
             warn!("raft rocksdb dir not set, use default dir {}", store_dir);
-            store_dir.clone()
+            store_dir.to_string()
         });
     info!("server.raft-data-dir uses {:?}", abs_data_dir);
 
@@ -865,10 +868,9 @@ fn run_raft_server(pd_client: RpcClient,
              rocksdb_util::CFOptions::new(CF_LOCK, get_rocksdb_lock_cf_option(config, total_mem)),
              rocksdb_util::CFOptions::new(CF_WRITE,
                                           get_rocksdb_write_cf_option(config, total_mem))];
-    let kv_engine = Arc::new(rocksdb_util::new_engine_opt(db_path.to_str().unwrap(),
-                                                          kv_db_opts,
-                                                          kv_cfs_opts)
-        .unwrap_or_else(|err| exit_with_err(format!("{:?}", err))));
+    let kv_engine =
+        Arc::new(rocksdb_util::new_engine_opt(db_path.to_str().unwrap(), kv_db_opts, kv_cfs_opts)
+            .unwrap_or_else(|err| exit_with_err(format!("{:?}", err))));
     let mut storage = create_raft_storage(raft_router.clone(), kv_engine.clone(), &cfg)
         .unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
 
