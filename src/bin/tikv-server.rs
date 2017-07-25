@@ -54,7 +54,7 @@ use std::time::Duration;
 use std::env;
 
 use clap::{Arg, App, ArgMatches};
-use rocksdb::{Options as RocksdbOptions, BlockBasedOptions};
+use rocksdb::{Options as RocksdbOptions, BlockBasedOptions, BlobdbOptions};
 use fs2::FileExt;
 use sys_info::{cpu_num, mem_info};
 
@@ -892,18 +892,16 @@ fn run_raft_server(pd_client: RpcClient,
 
     // Create raft_cf engine.
     let raft_rocksdb_dir = get_raft_rocksdb_data_dir(&cfg.storage.path, config);
-    let raft_path = Path::new(&raft_rocksdb_dir);
-    let raft_db_path = raft_path.join(Path::new("raft_db"));
-    let mut raft_db_opts = get_rocksdb_db_option(config);
-    get_concurrent_write_option(&mut raft_db_opts, config);
+    let raft_db_path = Path::new(&raft_rocksdb_dir).join(Path::new("raft_db"));
     let raft_cf_opts =
         vec![rocksdb_util::CFOptions::new(CF_DEFAULT,
                                           get_rocksdb_default_cf_option(config, total_mem)),
              rocksdb_util::CFOptions::new(CF_RAFT,
                                           get_rocksdb_raftlog_cf_option(config, total_mem))];
-    let raft_engine = Arc::new(rocksdb_util::new_engine_opt(raft_db_path.to_str().unwrap(),
-                                                            raft_db_opts,
-                                                            raft_cf_opts)
+    let raft_engine = Arc::new(rocksdb_util::new_blobdb_engine_opt(raft_db_path.to_str().unwrap(),
+                                                                   RocksdbOptions::new(),
+                                                                   BlobdbOptions::new(),
+                                                                   raft_cf_opts)
         .unwrap_or_else(|err| exit_with_err(format!("{:?}", err))));
 
     // Create node.
