@@ -138,7 +138,21 @@ fn main() {
                 .help("set start_ts as filter"))
             .arg(Arg::with_name("commit_ts")
                 .takes_value(true)
-                .help("set commit_ts as filter")));
+                .help("set commit_ts as filter")))
+        .subcommand(SubCommand::with_name("versions")
+            .about("print the sequence number")
+            .arg(Arg::with_name("start_key")
+                .short("S")
+                .takes_value(true)
+                .help("the start key"))
+            .arg(Arg::with_name("end_key")
+                .short("E")
+                .takes_value(true)
+                .help("the start key"))
+            .arg(Arg::with_name("encoded")
+                .short("e")
+                .takes_value(false)
+                .help("set it when the key is already encoded.")));
     let matches = app.clone().get_matches();
 
     let db_path = matches.value_of("db").unwrap();
@@ -219,6 +233,14 @@ fn main() {
                 let _ = app.print_help();
             }
         }
+    } else if let Some(matches) = matches.subcommand_matches("versions") {
+        let start_key = matches.value_of("start_key").unwrap();
+        let end_key = matches.value_of("start_key").unwrap();
+        let key_encoded = matches.is_present("encoded");
+        println!("You are searching start_key {}, end_key {}: ",
+                 start_key,
+                 end_key);
+        dump_key_versions(&db, start_key, end_key, key_encoded);
     } else {
         let _ = app.print_help();
     }
@@ -281,6 +303,28 @@ pub fn gen_mvcc_iter<T: MvccDeserializable>(db: &DB,
     }
 }
 
+
+fn dump_key_versions(db: &DB, start_key: &str, end_key: &str, encoded: bool) {
+    let (key1, key2) = if encoded {
+        (unescape(start_key), unescape(end_key))
+    } else {
+        (encode_bytes(unescape(start_key).as_slice()), encode_bytes(unescape(end_key).as_slice()))
+    };
+
+    match db.get_all_key_versions(key1.as_slice(), key2.as_slice()) {
+        Ok(versions) => {
+            for v in versions {
+                println!("key: {}, seq: {}, type: {}",
+                         escape(v.key.as_bytes()),
+                         v.seq,
+                         v.value_type);
+            }
+        }
+        Err(e) => {
+            println!("get key versions err: {:?}", e);
+        }
+    }
+}
 
 fn dump_mvcc_default(db: &DB, key: &str, encoded: bool, start_ts: Option<u64>) {
     let kvs: Vec<MvccKv<Vec<u8>>> = gen_mvcc_iter(db, key, encoded, CF_DEFAULT);
