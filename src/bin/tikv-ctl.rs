@@ -378,16 +378,18 @@ fn dump_raft_diff(db: &DB, db2: &DB, region_id: u64, start: u64, end: u64) {
     ropt.set_iterate_upper_bound(end_key);
     let mut iter2 = db2.iter_cf_opt(handle2, ropt);
 
+    let mut offset = 0;
     iter.seek(SeekKey::Key(start_key));
     iter2.seek(SeekKey::Key(start_key));
     while iter.valid() && iter2.valid() {
+        offset += 1;
         if iter.key() != iter2.key() {
             if iter.key() > iter2.key() {
-                println!("db1 lost some raft entry");
+                println!("db1 lost some raft entry, offset: {}", offset);
                 iter2.next();
                 continue;
             } else {
-                println!("db2 lost some raft entry");
+                println!("db2 lost some raft entry, offset: {}", offset);
                 iter.next();
                 continue;
             }
