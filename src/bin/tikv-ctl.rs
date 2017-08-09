@@ -30,7 +30,7 @@ use protobuf::Message;
 use kvproto::raft_cmdpb::RaftCmdRequest;
 use kvproto::raft_serverpb::{RaftLocalState, RegionLocalState, RaftApplyState, PeerState};
 use kvproto::eraftpb::Entry;
-use rocksdb::DB;
+use rocksdb::{DB, SeekKey, ReadOptions};
 use tikv::util::{self, escape, unescape};
 use tikv::util::codec::bytes::encode_bytes;
 use tikv::raftstore::store::keys;
@@ -152,7 +152,25 @@ fn main() {
             .arg(Arg::with_name("encoded")
                 .short("e")
                 .takes_value(false)
-                .help("set it when the key is already encoded.")));
+                .help("set it when the key is already encoded.")))
+        .subcommand(SubCommand::with_name("raftdiff")
+            .about("check raft entry diff")
+            .arg(Arg::with_name("to")
+                .short("t")
+                .takes_value(true)
+                .help("to which db"))
+            .arg(Arg::with_name("region")
+                .short("r")
+                .takes_value(true)
+                .help("region id"))
+            .arg(Arg::with_name("start")
+                .short("s")
+                .takes_value(true)
+                .help("start raft entry index"))
+            .arg(Arg::with_name("end")
+                .short("e")
+                .takes_value(true)
+                .help("end raft entry index")));
     let matches = app.clone().get_matches();
 
     let db_path = matches.value_of("db").unwrap();
@@ -241,6 +259,13 @@ fn main() {
                  start_key,
                  end_key);
         dump_key_versions(&db, start_key, end_key, key_encoded);
+    } else if let Some(matches) = matches.subcommand_matches("raftdiff") {
+        let region_id: u64 = matches.value_of("region").unwrap().parse().unwrap();
+        let start_idx: u64 = matches.value_of("start").unwrap().parse().unwrap();
+        let end_idx: u64 = matches.value_of("end").unwrap().parse().unwrap();
+        let db_path2 = matches.value_of("to").unwrap();
+        let db2 = util::rocksdb::open(db_path2, ALL_CFS).unwrap();
+        dump_raft_diff(&db, &db2, region_id, start_idx, end_idx);
     } else {
         let _ = app.print_help();
     }
@@ -323,6 +348,68 @@ fn dump_key_versions(db: &DB, start_key: &str, end_key: &str, encoded: bool) {
         Err(e) => {
             println!("get key versions err: {:?}", e);
         }
+    }
+}
+
+fn dump_raft_diff(db: &DB, db2: &DB, region_id: u64, start: u64, end: u64) {
+    println!("region id: {}", region_id);
+    let region_state_key = keys::region_state_key(region_id);
+    let region_state: RegionLocalState = db.get_msg(&region_state_key).unwrap().unwrap();
+    println!("db region state: {:?}", region_state);
+    let region_state2: RegionLocalState = db2.get_msg(&region_state_key).unwrap().unwrap();
+    println!("db2 region state: {:?}", region_state2);
+
+    let raft_state_key = keys::apply_state_key(region_id);
+
+    let apply_state: RaftApplyState = db.get_msg_cf("raft", &raft_state_key).unwrap().unwrap();
+    println!("db apply state: {:?}", apply_state);
+    let apply_state2: RaftApplyState = db2.get_msg_cf("raft", &raft_state_key).unwrap().unwrap();
+    println!("db2 apply state: {:?}", apply_state2);
+
+    let start_key = &keys::raft_log_key(region_id, start);
+    let end_key = &keys::raft_log_key(region_id, end);
+
+    let handle = db.cf_handle(CF_RAFT).unwrap();
+    let handle2 = db2.cf_handle(CF_RAFT).unwrap();
+    let mut ropt = ReadOptions::new();
+    ropt.set_iterate_upper_bound(end_key);
+    let mut iter = db.iter_cf_opt(handle, ropt);
+    let mut ropt = ReadOptions::new();
+    ropt.set_iterate_upper_bound(end_key);
+    let mut iter2 = db2.iter_cf_opt(handle2, ropt);
+
+    iter.seek(SeekKey::Key(start_key));
+    iter2.seek(SeekKey::Key(start_key));
+    while iter.valid() && iter2.valid() {
+        if iter.key() != iter2.key() {
+            if iter.key() > iter2.key() {
+                println!("db1 lost some raft entry");
+                iter2.next();
+                continue;
+            } else {
+                println!("db2 lost some raft entry");
+                iter.next();
+                continue;
+            }
+        }
+
+        if iter.value() != iter2.value() {
+            println!("db1 has value: {:?} at {:?}, but db2 has value: {:?} at {:?}",
+                     escape(iter.value()),
+                     escape(iter.key()),
+                     escape(iter2.value()),
+                     escape(iter2.key()));
+        }
+
+        iter.next();
+        iter2.next();
+    }
+
+    if !iter.valid() && iter2.valid() {
+        println!("iter1 invalid but iter2 valid!");
+    }
+    if iter.valid() && !iter2.valid() {
+        println!("iter1 valid but iter2 invalid!");
     }
 }
 
