@@ -73,7 +73,7 @@ impl RegionSnapshot {
                    -> Result<()>
         where F: FnMut(&[u8], &[u8]) -> Result<bool>
     {
-        let iter_opt = IterOption::new(Some(end_key.to_vec()), fill_cache);
+        let iter_opt = IterOption::new(Some(end_key.to_vec()), fill_cache, 0);
         self.scan_impl(self.iter(iter_opt), start_key, f)
     }
 
@@ -87,7 +87,7 @@ impl RegionSnapshot {
                       -> Result<()>
         where F: FnMut(&[u8], &[u8]) -> Result<bool>
     {
-        let iter_opt = IterOption::new(Some(end_key.to_vec()), fill_cache);
+        let iter_opt = IterOption::new(Some(end_key.to_vec()), fill_cache, 0);
         self.scan_impl(try!(self.iter_cf(cf, iter_opt)), start_key, f)
     }
 

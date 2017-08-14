@@ -20,17 +20,20 @@ pub struct SnapshotStore<'a> {
     snapshot: &'a Snapshot,
     start_ts: u64,
     isolation_level: IsolationLevel,
+    readahead_size: u64,
 }
 
 impl<'a> SnapshotStore<'a> {
     pub fn new(snapshot: &'a Snapshot,
                start_ts: u64,
-               isolation_level: IsolationLevel)
+               isolation_level: IsolationLevel,
+               readahead_size: u64)
                -> SnapshotStore {
         SnapshotStore {
             snapshot: snapshot,
             start_ts: start_ts,
             isolation_level: isolation_level,
+            readahead_size: readahead_size,
         }
     }
 
@@ -40,7 +43,8 @@ impl<'a> SnapshotStore<'a> {
                                          None,
                                          true,
                                          None,
-                                         self.isolation_level);
+                                         self.isolation_level,
+                                         self.readahead_size);
         let v = try!(reader.get(key, self.start_ts));
         Ok(v)
     }
@@ -55,7 +59,8 @@ impl<'a> SnapshotStore<'a> {
                                          None,
                                          true,
                                          None,
-                                         self.isolation_level);
+                                         self.isolation_level,
+                                         self.readahead_size);
         let mut results = Vec::with_capacity(keys.len());
         for k in keys {
             results.push(reader.get(k, self.start_ts).map_err(Error::from));
@@ -76,7 +81,8 @@ impl<'a> SnapshotStore<'a> {
                                          Some(mode),
                                          true,
                                          upper_bound,
-                                         self.isolation_level);
+                                         self.isolation_level,
+                                         self.readahead_size);
         reader.set_key_only(key_only);
         Ok(StoreScanner {
             reader: reader,

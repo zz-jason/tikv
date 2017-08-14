@@ -343,7 +343,7 @@ fn process_read(cid: u64, mut cmd: Command, ch: SyncSendCh<Msg>, snapshot: Box<S
         Command::Get { ref ctx, ref key, start_ts, .. } => {
             KV_COMMAND_KEYREAD_HISTOGRAM_VEC.with_label_values(&[tag]).observe(1f64);
             let snap_store =
-                SnapshotStore::new(snapshot.as_ref(), start_ts, ctx.get_isolation_level());
+                SnapshotStore::new(snapshot.as_ref(), start_ts, ctx.get_isolation_level(), 0);
             let res = snap_store.get(key, &mut statistics);
             match res {
                 Ok(val) => ProcessResult::Value { value: val },
@@ -355,7 +355,7 @@ fn process_read(cid: u64, mut cmd: Command, ch: SyncSendCh<Msg>, snapshot: Box<S
             KV_COMMAND_KEYREAD_HISTOGRAM_VEC.with_label_values(&[tag])
                 .observe(keys.len() as f64);
             let snap_store =
-                SnapshotStore::new(snapshot.as_ref(), start_ts, ctx.get_isolation_level());
+                SnapshotStore::new(snapshot.as_ref(), start_ts, ctx.get_isolation_level(), 0);
             match snap_store.batch_get(keys, &mut statistics) {
                 Ok(results) => {
                     let mut res = vec![];
@@ -374,7 +374,7 @@ fn process_read(cid: u64, mut cmd: Command, ch: SyncSendCh<Msg>, snapshot: Box<S
         // Scans a range starting with `start_key` up to `limit` rows from the snapshot.
         Command::Scan { ref ctx, ref start_key, limit, start_ts, ref options, .. } => {
             let snap_store =
-                SnapshotStore::new(snapshot.as_ref(), start_ts, ctx.get_isolation_level());
+                SnapshotStore::new(snapshot.as_ref(), start_ts, ctx.get_isolation_level(), 0);
             let res = snap_store.scanner(ScanMode::Forward, options.key_only, None, &mut statistics)
                 .and_then(|mut scanner| scanner.scan(start_key.clone(), limit))
                 .and_then(|mut results| {
@@ -400,7 +400,8 @@ fn process_read(cid: u64, mut cmd: Command, ch: SyncSendCh<Msg>, snapshot: Box<S
                                              Some(ScanMode::Forward),
                                              true,
                                              None,
-                                             ctx.get_isolation_level());
+                                             ctx.get_isolation_level(),
+                                             0);
             match find_mvcc_infos_by_key(&mut reader, key, u64::MAX) {
                 Ok((lock, writes, values)) => {
                     ProcessResult::MvccKey {
@@ -420,7 +421,8 @@ fn process_read(cid: u64, mut cmd: Command, ch: SyncSendCh<Msg>, snapshot: Box<S
                                              Some(ScanMode::Forward),
                                              true,
                                              None,
-                                             ctx.get_isolation_level());
+                                             ctx.get_isolation_level(),
+                                             0);
             match reader.seek_ts(start_ts)
                 .map_err(StorageError::from) {
                 Err(e) => ProcessResult::Failed { err: e.into() },
@@ -453,7 +455,8 @@ fn process_read(cid: u64, mut cmd: Command, ch: SyncSendCh<Msg>, snapshot: Box<S
                                              Some(ScanMode::Forward),
                                              true,
                                              None,
-                                             ctx.get_isolation_level());
+                                             ctx.get_isolation_level(),
+                                             0);
             let res = reader.scan_lock(None, |lock| lock.ts <= max_ts, None)
                 .map_err(Error::from)
                 .and_then(|(v, _)| {
@@ -482,7 +485,8 @@ fn process_read(cid: u64, mut cmd: Command, ch: SyncSendCh<Msg>, snapshot: Box<S
                                              Some(ScanMode::Forward),
                                              true,
                                              None,
-                                             ctx.get_isolation_level());
+                                             ctx.get_isolation_level(),
+                                             0);
             let res = reader.scan_lock(scan_key.take(),
                            |lock| lock.ts == start_ts,
                            Some(RESOLVE_LOCK_BATCH_SIZE))
@@ -516,7 +520,8 @@ fn process_read(cid: u64, mut cmd: Command, ch: SyncSendCh<Msg>, snapshot: Box<S
                                              Some(ScanMode::Forward),
                                              true,
                                              None,
-                                             ctx.get_isolation_level());
+                                             ctx.get_isolation_level(),
+                                             0);
             // scan_key is used as start_key here,and Range start gc with scan_key=none.
             let is_range_start_gc = scan_key.is_none();
             // This is an optimization to skip gc before scanning all data.

@@ -42,6 +42,8 @@ pub const REQ_TYPE_INDEX: i64 = 102;
 pub const REQ_TYPE_DAG: i64 = 103;
 pub const BATCH_ROW_COUNT: usize = 64;
 
+const READAHEAD_SIZE: u64 = 1024 * 1024;
+
 // If a request has been handled for more than 60 seconds, the client should
 // be timeout already, so it can be safely aborted.
 const REQUEST_MAX_HANDLE_SECS: u64 = 60;
@@ -275,7 +277,12 @@ impl BatchRunnable<Task> for Host {
                         let pri_str = get_req_pri_str(pri);
                         let type_str = get_req_type_str(req.req.get_tp());
                         COPR_PENDING_REQS.with_label_values(&[type_str, pri_str]).add(1.0);
-                        let end_point = TiDbEndPoint::new(snap.clone());
+                        let readahead_size = if pri == CommandPri::Low {
+                            READAHEAD_SIZE
+                        } else {
+                            0
+                        };
+                        let end_point = TiDbEndPoint::new(snap.clone(), readahead_size);
                         let txn_id = req.start_ts.unwrap_or_default();
 
                         if pri == CommandPri::Low {
@@ -388,11 +395,15 @@ fn respond(resp: Response, mut t: RequestTask) {
 
 pub struct TiDbEndPoint {
     snap: Box<Snapshot>,
+    readahead_size: u64,
 }
 
 impl TiDbEndPoint {
-    pub fn new(snap: Box<Snapshot>) -> TiDbEndPoint {
-        TiDbEndPoint { snap: snap }
+    pub fn new(snap: Box<Snapshot>, readahead_size: u64) -> TiDbEndPoint {
+        TiDbEndPoint {
+            snap: snap,
+            readahead_size: readahead_size,
+        }
     }
 }
 
@@ -417,7 +428,8 @@ impl TiDbEndPoint {
     fn handle_select(&self, sel: SelectRequest, t: &mut RequestTask) -> Result<Response> {
         let snap = SnapshotStore::new(self.snap.as_ref(),
                                       sel.get_start_ts(),
-                                      t.req.get_context().get_isolation_level());
+                                      t.req.get_context().get_isolation_level(),
+                                      self.readahead_size);
         let ctx = try!(SelectContext::new(sel, snap, t.deadline, &mut t.statistics));
         let range = t.req.get_ranges().to_vec();
         debug!("scanning range: {:?}", range);
@@ -433,7 +445,8 @@ impl TiDbEndPoint {
                                   ranges,
                                   self.snap.as_ref(),
                                   eval_ctx.clone(),
-                                  t.req.get_context().get_isolation_level());
+                                  t.req.get_context().get_isolation_level(),
+                                  self.readahead_size);
         ctx.handle_request(&mut t.statistics)
     }
 }

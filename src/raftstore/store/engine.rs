@@ -166,15 +166,17 @@ pub struct IterOption {
     prefix_same_as_start: bool,
     fill_cache: bool,
     seek_mode: SeekMode,
+    readahead_size: u64,
 }
 
 impl IterOption {
-    pub fn new(upper_bound: Option<Vec<u8>>, fill_cache: bool) -> IterOption {
+    pub fn new(upper_bound: Option<Vec<u8>>, fill_cache: bool, readahead_size: u64) -> IterOption {
         IterOption {
             upper_bound: upper_bound,
             prefix_same_as_start: false,
             fill_cache: fill_cache,
             seek_mode: SeekMode::TotalOrder,
+            readahead_size: readahead_size,
         }
     }
 
@@ -206,6 +208,12 @@ impl IterOption {
         self
     }
 
+    #[inline]
+    pub fn set_readahead_size(mut self, size: u64) -> IterOption {
+        self.readahead_size = size;
+        self
+    }
+
     pub fn build_read_opts(&self) -> ReadOptions {
         let mut opts = ReadOptions::new();
         opts.fill_cache(self.fill_cache);
@@ -216,6 +224,9 @@ impl IterOption {
         }
         if let Some(ref key) = self.upper_bound {
             opts.set_iterate_upper_bound(key);
+        }
+        if self.readahead_size > 0 {
+            opts.set_readahead_size(self.readahead_size as usize);
         }
         opts
     }
@@ -228,6 +239,7 @@ impl Default for IterOption {
             prefix_same_as_start: false,
             fill_cache: true,
             seek_mode: SeekMode::TotalOrder,
+            readahead_size: 0,
         }
     }
 }
@@ -242,7 +254,7 @@ pub trait Iterable {
     fn scan<F>(&self, start_key: &[u8], end_key: &[u8], fill_cache: bool, f: &mut F) -> Result<()>
         where F: FnMut(&[u8], &[u8]) -> Result<bool>
     {
-        let iter_opt = IterOption::new(Some(end_key.to_vec()), fill_cache);
+        let iter_opt = IterOption::new(Some(end_key.to_vec()), fill_cache, 0);
         scan_impl(self.new_iterator(iter_opt), start_key, f)
     }
 
@@ -256,7 +268,7 @@ pub trait Iterable {
                   -> Result<()>
         where F: FnMut(&[u8], &[u8]) -> Result<bool>
     {
-        let iter_opt = IterOption::new(Some(end_key.to_vec()), fill_cache);
+        let iter_opt = IterOption::new(Some(end_key.to_vec()), fill_cache, 0);
         scan_impl(try!(self.new_iterator_cf(cf, iter_opt)), start_key, f)
     }
 
@@ -412,7 +424,7 @@ pub fn delete_in_range_cf(db: &DB, cf: &str, start_key: &[u8], end_key: &[u8]) -
     let handle = try!(rocksdb::get_cf_handle(db, cf));
     try!(db.delete_file_in_range_cf(handle, start_key, end_key));
 
-    let iter_opt = IterOption::new(Some(end_key.to_vec()), false);
+    let iter_opt = IterOption::new(Some(end_key.to_vec()), false, 0);
     let mut it = try!(db.new_iterator_cf(cf, iter_opt));
 
     let mut wb = WriteBatch::new();

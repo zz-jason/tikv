@@ -86,7 +86,7 @@ impl<'a> MergedIterator<'a> {
         let mut iters = Vec::with_capacity(cfs.len());
         let mut heap = BinaryHeap::with_capacity(cfs.len());
         for (pos, cf) in cfs.into_iter().enumerate() {
-            let iter_opt = IterOption::new(Some(end_key.to_vec()), fill_cache);
+            let iter_opt = IterOption::new(Some(end_key.to_vec()), fill_cache, 0);
             let mut iter = try!(db.new_iterator_cf(cf, iter_opt));
             if iter.seek(start_key.into()) {
                 heap.push(KeyEntry::new(iter.key().to_vec(), pos, iter.value().len()));

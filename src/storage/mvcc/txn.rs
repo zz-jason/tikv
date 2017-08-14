@@ -51,7 +51,8 @@ impl<'a> MvccTxn<'a> {
                                     mode,
                                     true, // fill_cache
                                     None,
-                                    isolation_level),
+                                    isolation_level,
+                                    0),
             start_ts: start_ts,
             writes: vec![],
             write_size: 0,

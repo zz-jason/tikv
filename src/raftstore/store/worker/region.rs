@@ -131,7 +131,7 @@ impl SnapContext {
             try!(check_abort(abort));
             let handle = box_try!(rocksdb::get_cf_handle(&self.db, cf));
 
-            let iter_opt = IterOption::new(Some(end_key.to_vec()), false);
+            let iter_opt = IterOption::new(Some(end_key.to_vec()), false, 0);
             let mut it = box_try!(self.db.new_iterator_cf(cf, iter_opt));
 
             try!(check_abort(abort));

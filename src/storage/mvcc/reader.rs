@@ -37,6 +37,7 @@ pub struct MvccReader<'a> {
     fill_cache: bool,
     upper_bound: Option<Vec<u8>>,
     isolation_level: IsolationLevel,
+    readahead_size: u64,
 }
 
 impl<'a> MvccReader<'a> {
@@ -45,7 +46,8 @@ impl<'a> MvccReader<'a> {
                scan_mode: Option<ScanMode>,
                fill_cache: bool,
                upper_bound: Option<Vec<u8>>,
-               isolation_level: IsolationLevel)
+               isolation_level: IsolationLevel,
+               readahead_size: u64)
                -> MvccReader<'a> {
         MvccReader {
             snapshot: snapshot,
@@ -58,6 +60,7 @@ impl<'a> MvccReader<'a> {
             key_only: false,
             fill_cache: fill_cache,
             upper_bound: upper_bound,
+            readahead_size: readahead_size,
         }
     }
 
@@ -74,7 +77,7 @@ impl<'a> MvccReader<'a> {
             return Ok(vec![]);
         }
         if self.scan_mode.is_some() && self.data_cursor.is_none() {
-            let iter_opt = IterOption::new(None, self.fill_cache);
+            let iter_opt = IterOption::new(None, self.fill_cache, self.readahead_size);
             self.data_cursor = Some(try!(self.snapshot.iter(iter_opt, self.get_scan_mode(true))));
         }
 
@@ -99,7 +102,7 @@ impl<'a> MvccReader<'a> {
 
     pub fn load_lock(&mut self, key: &Key) -> Result<Option<Lock>> {
         if self.scan_mode.is_some() && self.lock_cursor.is_none() {
-            let iter_opt = IterOption::new(None, true);
+            let iter_opt = IterOption::new(None, true, self.readahead_size);
             let iter = try!(self.snapshot.iter_cf(CF_LOCK, iter_opt, self.get_scan_mode(true)));
             self.lock_cursor = Some(iter);
         }
@@ -147,7 +150,7 @@ impl<'a> MvccReader<'a> {
                        -> Result<Option<(u64, Write)>> {
         if self.scan_mode.is_some() {
             if self.write_cursor.is_none() {
-                let iter_opt = IterOption::new(None, self.fill_cache);
+                let iter_opt = IterOption::new(None, self.fill_cache, self.readahead_size);
                 let iter = try!(self.snapshot
                     .iter_cf(CF_WRITE, iter_opt, self.get_scan_mode(false)));
                 self.write_cursor = Some(iter);
@@ -255,7 +258,7 @@ impl<'a> MvccReader<'a> {
     fn create_data_cursor(&mut self) -> Result<()> {
         self.scan_mode = Some(ScanMode::Forward);
         if self.data_cursor.is_none() {
-            let iter_opt = IterOption::new(None, self.fill_cache);
+            let iter_opt = IterOption::new(None, self.fill_cache, self.readahead_size);
             let iter = try!(self.snapshot.iter(iter_opt, self.get_scan_mode(true)));
             self.data_cursor = Some(iter);
         }
@@ -264,7 +267,9 @@ impl<'a> MvccReader<'a> {
 
     fn create_write_cursor(&mut self) -> Result<()> {
         if self.write_cursor.is_none() {
-            let iter_opt = IterOption::new(self.upper_bound.as_ref().cloned(), self.fill_cache);
+            let iter_opt = IterOption::new(self.upper_bound.as_ref().cloned(),
+                                           self.fill_cache,
+                                           self.readahead_size);
             let iter = try!(self.snapshot.iter_cf(CF_WRITE, iter_opt, self.get_scan_mode(false)));
             self.write_cursor = Some(iter);
         }
@@ -273,7 +278,9 @@ impl<'a> MvccReader<'a> {
 
     fn create_lock_cursor(&mut self) -> Result<()> {
         if self.lock_cursor.is_none() {
-            let iter_opt = IterOption::new(self.upper_bound.as_ref().cloned(), true);
+            let iter_opt = IterOption::new(self.upper_bound.as_ref().cloned(),
+                                           true,
+                                           self.readahead_size);
             let iter = try!(self.snapshot.iter_cf(CF_LOCK, iter_opt, self.get_scan_mode(true)));
             self.lock_cursor = Some(iter);
         }
@@ -431,7 +438,7 @@ impl<'a> MvccReader<'a> {
                      mut start: Option<Key>,
                      limit: usize)
                      -> Result<(Vec<Key>, Option<Key>)> {
-        let iter_opt = IterOption::new(None, self.fill_cache);
+        let iter_opt = IterOption::new(None, self.fill_cache, self.readahead_size);
         let scan_mode = self.get_scan_mode(false);
         let mut cursor = try!(self.snapshot.iter_cf(CF_WRITE, iter_opt, scan_mode));
         let mut keys = vec![];
