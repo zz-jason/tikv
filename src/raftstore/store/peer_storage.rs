@@ -984,6 +984,14 @@ impl PeerStorage {
         self.raft_engine.clone()
     }
 
+    /// Raft state machine will be suspended when applying snapshot.
+    pub fn is_suspended(&self) -> bool {
+        match *self.snap_state.borrow() {
+            SnapState::ApplyAborted | SnapState::Applying(_) => true,
+            _ => false,
+        }
+    }
+
     /// Check whether the storage has finished applying snapshot.
     #[inline]
     pub fn is_applying_snapshot(&self) -> bool {

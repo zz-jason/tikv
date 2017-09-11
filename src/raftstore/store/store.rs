@@ -1966,7 +1966,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             return Ok(());
         }
         let (mut last_region_id, mut compacted_idx, mut compacted_term) = (0, u64::MAX, u64::MAX);
-        let mut is_applying_snap = false;
+        let mut is_suspended = false;
         for (key, is_sending) in snap_keys {
             if last_region_id != key.region_id {
                 last_region_id = key.region_id;
@@ -1975,13 +1975,13 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                         // region is deleted
                         compacted_idx = u64::MAX;
                         compacted_term = u64::MAX;
-                        is_applying_snap = false;
+                        is_suspended = false;
                     }
                     Some(peer) => {
                         let s = peer.get_store();
                         compacted_idx = s.truncated_index();
                         compacted_term = s.truncated_term();
-                        is_applying_snap = s.is_applying_snapshot();
+                        is_suspended = s.is_suspended();
                     }
                 };
             }
@@ -2009,7 +2009,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                     }
                 }
             } else if key.term <= compacted_term &&
-                (key.idx < compacted_idx || key.idx == compacted_idx && !is_applying_snap)
+                (key.idx < compacted_idx || key.idx == compacted_idx && !is_suspended)
             {
                 info!(
                     "[region {}] snap file {} has been applied, delete.",
