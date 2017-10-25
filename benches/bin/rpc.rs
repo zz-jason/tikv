@@ -13,22 +13,22 @@
 
 use std::thread;
 use std::str::FromStr;
-use std::time::{Instant, Duration};
-use std::net::{SocketAddr, IpAddr};
+use std::time::{Duration, Instant};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Sender, Receiver, channel};
+use std::sync::mpsc::{channel, Receiver, Sender};
 
 use kvproto::tikvpb_grpc::*;
 use kvproto::coprocessor::{Request, Response};
-use kvproto::raft_serverpb::{RaftMessage, Done, SnapshotChunk};
+use kvproto::raft_serverpb::{Done, RaftMessage, SnapshotChunk};
 use kvproto::kvrpcpb::*;
 
-use futures::{Future, Stream, future};
-use grpc::{Server as GrpcServer, ServerBuilder, Environment, ChannelBuilder, RpcContext,
-           UnarySink, RequestStream, ClientStreamingSink};
+use futures::{future, Future, Stream};
+use grpc::{ChannelBuilder, ClientStreamingSink, Environment, RequestStream, RpcContext,
+           Server as GrpcServer, ServerBuilder, UnarySink};
 
-use tikv::server::{RaftClient, Config};
+use tikv::server::{Config, RaftClient};
 
 use super::print_result;
 
@@ -50,11 +50,12 @@ struct BenchTikvHandler {
 }
 
 impl BenchTikvHandler {
-    fn init_recording(&self,
-                      name: String,
-                      counter: Arc<AtomicUsize>,
-                      forwarder: Sender<()>)
-                      -> Result<(), String> {
+    fn init_recording(
+        &self,
+        name: String,
+        counter: Arc<AtomicUsize>,
+        forwarder: Sender<()>,
+    ) -> Result<(), String> {
         let mut running = self.running.lock().unwrap();
         if running.is_some() {
             return Err(running.as_ref().unwrap().name.clone());
@@ -74,7 +75,11 @@ impl BenchTikvHandler {
             return Err("not initialize".to_owned());
         }
 
-        running.as_ref().unwrap().counter.store(1, Ordering::Release);
+        running
+            .as_ref()
+            .unwrap()
+            .counter
+            .store(1, Ordering::Release);
         Ok(())
     }
 
@@ -90,24 +95,47 @@ impl BenchTikvHandler {
 }
 
 impl Tikv for BenchTikvHandler {
-    fn raft(&self,
-            ctx: RpcContext,
-            stream: RequestStream<RaftMessage>,
-            _: ClientStreamingSink<Done>) {
+    fn raft(
+        &self,
+        ctx: RpcContext,
+        stream: RequestStream<RaftMessage>,
+        _: ClientStreamingSink<Done>,
+    ) {
         let running = self.running.lock().unwrap();
         let inner = running.as_ref().unwrap();
         let counter = inner.counter.clone();
         let forwarder = inner.forwarder.as_ref().unwrap().clone();
 
-        ctx.spawn(stream.for_each(move |_| {
-                if 0 != counter.load(Ordering::Acquire) {
-                    counter.fetch_add(1, Ordering::Release);
-                    let _ = forwarder.send(());
-                };
-                future::ok(())
-            })
-            .map_err(|_| ())
-            .then(|_| future::ok::<_, ()>(())));
+        ctx.spawn(
+            stream
+                .for_each(move |_| {
+                    if 0 != counter.load(Ordering::Acquire) {
+                        counter.fetch_add(1, Ordering::Release);
+                        let _ = forwarder.send(());
+                    };
+                    future::ok(())
+                })
+                .map_err(|_| ())
+                .then(|_| future::ok::<_, ()>(())),
+        );
+    }
+
+    fn kv_delete_range(
+        &self,
+        _: RpcContext,
+        _: DeleteRangeRequest,
+        _: UnarySink<DeleteRangeResponse>,
+    ) {
+        unimplemented!()
+    }
+
+    fn split_region(
+        &self,
+        _: RpcContext,
+        _: SplitRegionRequest,
+        _: UnarySink<SplitRegionResponse>,
+    ) {
+        unimplemented!()
     }
 
     fn kv_get(&self, _: RpcContext, _: GetRequest, _: UnarySink<GetResponse>) {
@@ -138,10 +166,12 @@ impl Tikv for BenchTikvHandler {
         unimplemented!()
     }
 
-    fn kv_batch_rollback(&self,
-                         _: RpcContext,
-                         _: BatchRollbackRequest,
-                         _: UnarySink<BatchRollbackResponse>) {
+    fn kv_batch_rollback(
+        &self,
+        _: RpcContext,
+        _: BatchRollbackRequest,
+        _: UnarySink<BatchRollbackResponse>,
+    ) {
         unimplemented!()
     }
 
@@ -149,10 +179,12 @@ impl Tikv for BenchTikvHandler {
         unimplemented!()
     }
 
-    fn kv_resolve_lock(&self,
-                       _: RpcContext,
-                       _: ResolveLockRequest,
-                       _: UnarySink<ResolveLockResponse>) {
+    fn kv_resolve_lock(
+        &self,
+        _: RpcContext,
+        _: ResolveLockRequest,
+        _: UnarySink<ResolveLockResponse>,
+    ) {
         unimplemented!()
     }
 
@@ -176,10 +208,12 @@ impl Tikv for BenchTikvHandler {
         unimplemented!()
     }
 
-    fn snapshot(&self,
-                _: RpcContext,
-                _: RequestStream<SnapshotChunk>,
-                _: ClientStreamingSink<Done>) {
+    fn snapshot(
+        &self,
+        _: RpcContext,
+        _: RequestStream<SnapshotChunk>,
+        _: ClientStreamingSink<Done>,
+    ) {
         unimplemented!()
     }
 
@@ -187,17 +221,21 @@ impl Tikv for BenchTikvHandler {
         unimplemented!()
     }
 
-    fn mvcc_get_by_key(&self,
-                       _: RpcContext,
-                       _: MvccGetByKeyRequest,
-                       _: UnarySink<MvccGetByKeyResponse>) {
+    fn mvcc_get_by_key(
+        &self,
+        _: RpcContext,
+        _: MvccGetByKeyRequest,
+        _: UnarySink<MvccGetByKeyResponse>,
+    ) {
         unimplemented!()
     }
 
-    fn mvcc_get_by_start_ts(&self,
-                            _: RpcContext,
-                            _: MvccGetByStartTsRequest,
-                            _: UnarySink<MvccGetByStartTsResponse>) {
+    fn mvcc_get_by_start_ts(
+        &self,
+        _: RpcContext,
+        _: MvccGetByStartTsRequest,
+        _: UnarySink<MvccGetByStartTsResponse>,
+    ) {
         unimplemented!()
     }
 }
@@ -224,7 +262,9 @@ pub struct BenchTikvServer {
 
 impl BenchTikvServer {
     pub fn new(env: Arc<Environment>) -> BenchTikvServer {
-        let h = BenchTikvHandler { running: Arc::new(Mutex::new(None)) };
+        let h = BenchTikvHandler {
+            running: Arc::new(Mutex::new(None)),
+        };
 
         let channel_args = ChannelBuilder::new(env.clone())
             .stream_initial_window_size(DEFAULT_GRPC_STREAM_INITIAL_WINDOW_SIZE)
@@ -281,7 +321,11 @@ impl BenchTikvServer {
 
     pub fn recv(&self) -> Result<(), String> {
         if self.rx.is_some() {
-            self.rx.as_ref().unwrap().recv().map_err(|_| "channel has hung up".to_owned())
+            self.rx
+                .as_ref()
+                .unwrap()
+                .recv()
+                .map_err(|_| "channel has hung up".to_owned())
         } else {
             Err("Benchmark is not ready".to_owned())
         }
@@ -346,7 +390,7 @@ pub fn bench_raft_rpc() {
     let count = server.stop_recording().unwrap();
 
     let qps = count as f64 /
-              (duration.as_secs() as f64 + duration.subsec_nanos() as f64 / NANOS_PER_SEC as f64);
+        (duration.as_secs() as f64 + duration.subsec_nanos() as f64 / NANOS_PER_SEC as f64);
     printf!("\tQPS: {:.1}", qps);
     print_result(result);
 
