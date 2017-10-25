@@ -26,9 +26,6 @@
 /// assert_eq!(count_args!(1, 2, 3), 3);
 /// # }
 /// ```
-///
-/// [rfc#88](https://github.com/rust-lang/rfcs/pull/88) proposes to use $# to count the number
-/// of args, but it has not been implemented yet.
 #[macro_export]
 macro_rules! count_args {
     () => { 0 };
@@ -65,13 +62,16 @@ macro_rules! count_args {
 macro_rules! map {
     () => {
         {
-            $crate::util::collections::HashMap::new()
+            $crate::util::collections::HashMap::default()
         }
     };
     ( $( $k:expr => $v:expr ),+ ) => {
         {
-            let mut temp_map = $crate::util::collections::HashMap::with_capacity(
-                count_args!($(($k, $v)),+));
+            let mut temp_map =
+                $crate::util::collections::HashMap::with_capacity_and_hasher(
+                    count_args!($(($k, $v)),+),
+                    Default::default()
+                );
             $(
                 temp_map.insert($k, $v);
             )+
@@ -144,35 +144,12 @@ macro_rules! thd_name {
 /// Simulating go's defer.
 ///
 /// Please note that, different from go, this defer is bound to scope.
+/// When exiting the scope, its deferred calls are executed in last-in-first-out order.
 #[macro_export]
 macro_rules! defer {
     ($t:expr) => (
         let __ctx = $crate::util::DeferContext::new(|| $t);
     );
-}
-
-/// Get the opposite numbers of negative numbers.
-#[cfg(debug_assertions)]
-#[macro_export]
-macro_rules! opp_neg {
-    ($r:ident) => {
-        // in debug mode, if r is `i64::min_value()`, `-r` will panic.
-        // but in release mode, `-r as u64` will get `|r|`.
-        if $r == i64::min_value() {
-            i64::max_value() as u64 + 1
-        } else {
-            -$r as u64
-        }
-    };
-}
-
-/// Get the opposite numbers of negative numbers.
-#[cfg(not(debug_assertions))]
-#[macro_export]
-macro_rules! opp_neg {
-    ($r:ident) => {
-        (-$r as u64)
-    };
 }
 
 /// `wait_op!` waits for async operation. It returns `Option<Res>`
@@ -200,4 +177,16 @@ macro_rules! wait_op {
             }
         }
     }
+}
+
+/// `try_opt` check `Result<Option<T>>`, return early when met `Err` or `Ok(None)`.
+#[macro_export]
+macro_rules! try_opt {
+    ($expr:expr) => ({
+        match $expr {
+            Err(e) => return Err(e.into()),
+            Ok(None) => return Ok(None),
+            Ok(Some(res)) => res,
+        }
+    });
 }

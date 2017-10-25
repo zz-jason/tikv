@@ -12,28 +12,28 @@
 // limitations under the License.
 
 use std::sync::{Arc, RwLock};
-use std::sync::mpsc::Sender;
-use std::net::{SocketAddr, IpAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
-use grpc::{Server as GrpcServer, ServerBuilder, Environment, ChannelBuilder};
+use grpc::{ChannelBuilder, EnvBuilder, Environment, Server as GrpcServer, ServerBuilder};
 use kvproto::tikvpb_grpc::*;
-use util::worker::Worker;
-use storage::Storage;
-use raftstore::store::{SnapshotStatusMsg, SnapManager};
-use raftstore::store::config::REGION_SPLIT_SIZE;
+use kvproto::debugpb_grpc::create_debug;
 
-use super::{Result, Config};
+use util::worker::{FutureScheduler, Worker};
+use storage::Storage;
+use raftstore::store::{Engines, SnapManager};
+
+use super::{Config, Result};
 use coprocessor::{EndPointHost, EndPointTask};
-use super::grpc_service::Service;
+use super::service::*;
 use super::transport::{RaftStoreRouter, ServerTransport};
 use super::resolve::StoreAddrResolver;
-use super::snap::{Task as SnapTask, Runner as SnapHandler};
+use super::snap::{Runner as SnapHandler, Task as SnapTask};
 use super::raft_client::RaftClient;
+use pd::PdTask;
 
-const DEFAULT_COPROCESSOR_BATCH: usize = 50;
+const DEFAULT_COPROCESSOR_BATCH: usize = 256;
 const MAX_GRPC_RECV_MSG_LEN: usize = 10 * 1024 * 1024;
-const MAX_GRPC_SEND_MSG_LEN: usize = 4 * REGION_SPLIT_SIZE as usize;
 
 pub struct Server<T: RaftStoreRouter + 'static, S: StoreAddrResolver + 'static> {
     env: Arc<Environment>,
@@ -50,49 +50,68 @@ pub struct Server<T: RaftStoreRouter + 'static, S: StoreAddrResolver + 'static> 
     // For sending/receiving snapshots.
     snap_mgr: SnapManager,
     snap_worker: Worker<SnapTask>,
+    pd_scheduler: FutureScheduler<PdTask>,
 }
 
 impl<T: RaftStoreRouter, S: StoreAddrResolver + 'static> Server<T, S> {
-    pub fn new(cfg: &Config,
-               storage: Storage,
-               raft_router: T,
-               snapshot_status_sender: Sender<SnapshotStatusMsg>,
-               resolver: S,
-               snap_mgr: SnapManager)
-               -> Result<Server<T, S>> {
-        let env = Arc::new(Environment::new(cfg.grpc_concurrency));
+    #[allow(too_many_arguments)]
+    pub fn new(
+        cfg: &Config,
+        region_split_size: usize,
+        storage: Storage,
+        raft_router: T,
+        resolver: S,
+        snap_mgr: SnapManager,
+        pd_scheduler: FutureScheduler<PdTask>,
+        debug_engines: Option<Engines>,
+    ) -> Result<Server<T, S>> {
+        let env = Arc::new(
+            EnvBuilder::new()
+                .cq_count(cfg.grpc_concurrency)
+                .name_prefix(thd_name!("grpc-server"))
+                .build(),
+        );
         let raft_client = Arc::new(RwLock::new(RaftClient::new(env.clone(), cfg.clone())));
         let end_point_worker = Worker::new("end-point-worker");
         let snap_worker = Worker::new("snap-handler");
 
-        let h = Service::new(storage.clone(),
-                             end_point_worker.scheduler(),
-                             raft_router.clone(),
-                             snap_worker.scheduler());
-        let addr = try!(SocketAddr::from_str(&cfg.addr));
+        let kv_service = KvService::new(
+            storage.clone(),
+            end_point_worker.scheduler(),
+            raft_router.clone(),
+            snap_worker.scheduler(),
+        );
+        let addr = SocketAddr::from_str(&cfg.addr)?;
+        info!("listening on {}", addr);
         let ip = format!("{}", addr.ip());
         let channel_args = ChannelBuilder::new(env.clone())
-            .stream_initial_window_size(cfg.grpc_stream_initial_window_size)
+            .stream_initial_window_size(cfg.grpc_stream_initial_window_size.0 as usize)
             .max_concurrent_stream(cfg.grpc_concurrent_stream)
             .max_receive_message_len(MAX_GRPC_RECV_MSG_LEN)
-            .max_send_message_len(MAX_GRPC_SEND_MSG_LEN)
+            .max_send_message_len(region_split_size as usize * 4)
             .build_args();
-        let grpc_server = try!(ServerBuilder::new(env.clone())
-            .register_service(create_tikv(h))
-            .bind(ip, addr.port())
-            .channel_args(channel_args)
-            .build());
+        let grpc_server = {
+            let mut sb = ServerBuilder::new(env.clone())
+                .bind(ip, addr.port())
+                .channel_args(channel_args)
+                .register_service(create_tikv(kv_service));
+            if let Some(engines) = debug_engines {
+                sb = sb.register_service(create_debug(DebugService::new(engines)));
+            }
+            sb.build()?
+        };
 
         let addr = {
             let (ref host, port) = grpc_server.bind_addrs()[0];
-            SocketAddr::new(try!(IpAddr::from_str(host)), port as u16)
+            SocketAddr::new(IpAddr::from_str(host)?, port as u16)
         };
 
-        let trans = ServerTransport::new(raft_client,
-                                         snap_worker.scheduler(),
-                                         raft_router.clone(),
-                                         snapshot_status_sender,
-                                         resolver);
+        let trans = ServerTransport::new(
+            raft_client,
+            snap_worker.scheduler(),
+            raft_router.clone(),
+            resolver,
+        );
 
         let svr = Server {
             env: env.clone(),
@@ -104,6 +123,7 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver + 'static> Server<T, S> {
             end_point_worker: end_point_worker,
             snap_mgr: snap_mgr,
             snap_worker: snap_worker,
+            pd_scheduler: pd_scheduler,
         };
 
         Ok(svr)
@@ -114,15 +134,21 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver + 'static> Server<T, S> {
     }
 
     pub fn start(&mut self, cfg: &Config) -> Result<()> {
-        let end_point = EndPointHost::new(self.storage.get_engine(),
-                                          self.end_point_worker.scheduler(),
-                                          cfg.end_point_concurrency,
-                                          cfg.end_point_txn_concurrency_on_busy,
-                                          cfg.end_point_small_txn_tasks_limit);
-        box_try!(self.end_point_worker.start_batch(end_point, DEFAULT_COPROCESSOR_BATCH));
-        let snap_runner = SnapHandler::new(self.env.clone(),
-                                           self.snap_mgr.clone(),
-                                           self.raft_router.clone());
+        let end_point = EndPointHost::new(
+            self.storage.get_engine(),
+            self.end_point_worker.scheduler(),
+            cfg,
+            self.pd_scheduler.clone(),
+        );
+        box_try!(
+            self.end_point_worker
+                .start_batch(end_point, DEFAULT_COPROCESSOR_BATCH)
+        );
+        let snap_runner = SnapHandler::new(
+            self.env.clone(),
+            self.snap_mgr.clone(),
+            self.raft_router.clone(),
+        );
         box_try!(self.snap_worker.start(snap_runner));
         self.grpc_server.start();
         info!("TiKV is ready to serve");
@@ -153,18 +179,20 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::sync::mpsc::{self, Sender};
     use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use super::super::{Result, Config};
+    use super::super::{Config, Result};
     use super::super::transport::RaftStoreRouter;
-    use super::super::resolve::{StoreAddrResolver, Callback as ResolveCallback};
-    use storage::Storage;
+    use super::super::resolve::{Callback as ResolveCallback, StoreAddrResolver};
+    use storage::{Config as StorageConfig, Storage};
     use kvproto::raft_serverpb::RaftMessage;
     use raftstore::Result as RaftStoreResult;
     use raftstore::store::Msg as StoreMsg;
+    use raftstore::store::*;
     use raftstore::store::transport::Transport;
+    use util::worker::FutureWorker;
 
+    #[derive(Clone)]
     struct MockResolver {
         addr: Arc<Mutex<Option<SocketAddr>>>,
     }
@@ -179,16 +207,7 @@ mod tests {
     #[derive(Clone)]
     struct TestRaftStoreRouter {
         tx: Sender<usize>,
-        report_unreachable_count: Arc<AtomicUsize>,
-    }
-
-    impl TestRaftStoreRouter {
-        fn new(tx: Sender<usize>) -> TestRaftStoreRouter {
-            TestRaftStoreRouter {
-                tx: tx,
-                report_unreachable_count: Arc::new(AtomicUsize::new(0)),
-            }
-        }
+        significant_msg_sender: Sender<SignificantMsg>,
     }
 
     impl RaftStoreRouter for TestRaftStoreRouter {
@@ -202,46 +221,54 @@ mod tests {
             Ok(())
         }
 
-        fn report_unreachable(&self, _: u64, _: u64, _: u64) -> RaftStoreResult<()> {
-            let count = self.report_unreachable_count.clone();
-            count.fetch_add(1, Ordering::SeqCst);
+        fn significant_send(&self, msg: SignificantMsg) -> RaftStoreResult<()> {
+            self.significant_msg_sender.send(msg).unwrap();
             Ok(())
         }
     }
 
     #[test]
     fn test_peer_resolve() {
-        let mut cfg = Config::new();
+        let mut cfg = Config::default();
+        let storage_cfg = StorageConfig::default();
         cfg.addr = "127.0.0.1:0".to_owned();
 
-        let mut storage = Storage::new(&cfg.storage).unwrap();
-        storage.start(&cfg.storage).unwrap();
+        let mut storage = Storage::new(&storage_cfg).unwrap();
+        storage.start(&storage_cfg).unwrap();
 
         let (tx, rx) = mpsc::channel();
-        let router = TestRaftStoreRouter::new(tx);
-        let report_unreachable_count = router.report_unreachable_count.clone();
-        let (snapshot_status_sender, _) = mpsc::channel();
+        let (significant_msg_sender, significant_msg_receiver) = mpsc::channel();
+        let router = TestRaftStoreRouter {
+            tx: tx,
+            significant_msg_sender: significant_msg_sender,
+        };
 
         let addr = Arc::new(Mutex::new(None));
-        let mut server =
-            Server::new(&cfg,
-                        storage,
-                        router,
-                        snapshot_status_sender,
-                        MockResolver { addr: addr.clone() },
-                        SnapManager::new("", None, cfg.raft_store.use_sst_file_snapshot))
-                .unwrap();
+        let pd_worker = FutureWorker::new("pd worker");
+        let mut server = Server::new(
+            &cfg,
+            1024,
+            storage,
+            router,
+            MockResolver { addr: addr.clone() },
+            SnapManager::new("", None),
+            pd_worker.scheduler(),
+            None,
+        ).unwrap();
         *addr.lock().unwrap() = Some(server.listening_addr());
 
         server.start(&cfg).unwrap();
 
         let mut trans = server.transport();
-        for i in 0..10 {
-            if i % 2 == 1 {
-                trans.report_unreachable(RaftMessage::new());
+        trans.report_unreachable(RaftMessage::new());
+        assert_eq!(
+            significant_msg_receiver.try_recv().unwrap(),
+            SignificantMsg::Unreachable {
+                region_id: 0,
+                to_peer_id: 0,
             }
-            assert_eq!(report_unreachable_count.load(Ordering::SeqCst), (i + 1) / 2);
-        }
+        );
+
         let mut msg = RaftMessage::new();
         msg.set_region_id(1);
         trans.send(msg).unwrap();

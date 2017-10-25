@@ -16,7 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub fn get_file_size(path: &PathBuf) -> io::Result<u64> {
-    let meta = try!(fs::metadata(path));
+    let meta = fs::metadata(path)?;
     Ok(meta.len())
 }
 
@@ -51,7 +51,11 @@ mod test {
         // Ensure it works to get the size of an empty file.
         let empty_file = dir_path.join("empty_file");
         {
-            let _ = OpenOptions::new().write(true).create_new(true).open(&empty_file).unwrap();
+            let _ = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&empty_file)
+                .unwrap();
         }
         assert_eq!(get_file_size(&empty_file).unwrap(), 0);
 
@@ -60,8 +64,11 @@ mod test {
         let size = 5;
         let v = vec![0; size];
         {
-            let mut f =
-                OpenOptions::new().write(true).create_new(true).open(&non_empty_file).unwrap();
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&non_empty_file)
+                .unwrap();
             f.write_all(&v[..]).unwrap();
         }
         assert_eq!(get_file_size(&non_empty_file).unwrap(), size as u64);
@@ -80,7 +87,11 @@ mod test {
 
         let existent_file = dir_path.join("empty_file");
         {
-            let _ = OpenOptions::new().write(true).create_new(true).open(&existent_file).unwrap();
+            let _ = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&existent_file)
+                .unwrap();
         }
         assert_eq!(file_exists(&existent_file), true);
 
@@ -95,22 +106,15 @@ mod test {
 
         let existent_file = dir_path.join("empty_file");
         {
-            let _ = OpenOptions::new().write(true).create_new(true).open(&existent_file).unwrap();
+            let _ = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&existent_file)
+                .unwrap();
         }
         assert_eq!(file_exists(&existent_file), true);
         delete_file_if_exist(&existent_file);
         assert_eq!(file_exists(&existent_file), false);
-
-        let perm_file = dir_path.join("perm_file");
-        {
-            let f = OpenOptions::new().write(true).create_new(true).open(&perm_file).unwrap();
-            let mut perm = f.metadata().unwrap().permissions();
-            perm.set_readonly(true);
-            f.set_permissions(perm).unwrap();
-        }
-        assert_eq!(file_exists(&perm_file), true);
-        delete_file_if_exist(&perm_file);
-        assert_eq!(file_exists(&perm_file), false);
 
         let non_existent_file = dir_path.join("non_existent_file");
         delete_file_if_exist(&non_existent_file);

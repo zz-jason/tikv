@@ -11,31 +11,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt::{self, Formatter, Display};
-use std::io;
-use std::iter::{self, Once};
+use std::fmt::{self, Display, Formatter};
 use std::net::SocketAddr;
 use std::boxed::FnBox;
 use std::time::Instant;
-use std::result;
-use std::sync::{RwLock, Arc};
+use std::sync::{Arc, RwLock};
 
-use threadpool::ThreadPool;
 use mio::Token;
-use futures::{stream, Future, Stream};
-use grpc::{Environment, ChannelBuilder, WriteFlags};
+use futures::{Async, Future, Poll, Stream};
+use futures::stream::{self, Once};
+use grpc::{ChannelBuilder, Environment, WriteFlags};
 use kvproto::raft_serverpb::SnapshotChunk;
 use kvproto::raft_serverpb::RaftMessage;
 use kvproto::tikvpb_grpc::TikvClient;
 
-use raftstore::store::{SnapManager, SnapKey, SnapEntry, Snapshot};
+use raftstore::store::{SnapEntry, SnapKey, SnapManager, Snapshot};
+use util::threadpool::{DefaultContext, ThreadPool, ThreadPoolBuilder};
 use util::worker::Runnable;
 use util::buf::PipeBuffer;
 use util::collections::{HashMap, HashMapEntry as Entry};
 use util::HandyRwLock;
 
 use super::metrics::*;
-use super::{Result, Error};
+use super::{Error, Result};
 use super::transport::RaftStoreRouter;
 
 pub type Callback = Box<FnBox(Result<()>) + Send>;
@@ -68,9 +66,9 @@ impl Display for Task {
             Task::Write(token, _) => write!(f, "Write snap for {:?}", token),
             Task::Close(token) => write!(f, "Close file {:?}", token),
             Task::Discard(token) => write!(f, "Discard file {:?}", token),
-            Task::SendTo { ref addr, ref msg, .. } => {
-                write!(f, "SendTo Snap[to: {}, snap: {:?}]", addr, msg)
-            }
+            Task::SendTo {
+                ref addr, ref msg, ..
+            } => write!(f, "SendTo Snap[to: {}, snap: {:?}]", addr, msg),
         }
     }
 }
@@ -82,21 +80,26 @@ struct SnapChunk {
 
 const SNAP_CHUNK_LEN: usize = 1024 * 1024;
 
-impl Iterator for SnapChunk {
-    type Item = result::Result<Vec<u8>, io::Error>;
+impl Stream for SnapChunk {
+    type Item = (SnapshotChunk, WriteFlags);
+    type Error = Error;
 
-    fn next(&mut self) -> Option<Self::Item> {
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Error> {
         let mut buf = match self.remain_bytes {
-            0 => return None,
+            0 => return Ok(Async::Ready(None)),
             n if n > SNAP_CHUNK_LEN => vec![0; SNAP_CHUNK_LEN],
             n => vec![0; n],
         };
         match self.snap.wl().read_exact(buf.as_mut_slice()) {
             Ok(_) => {
                 self.remain_bytes -= buf.len();
-                Some(Ok(buf))
+                let mut chunk = SnapshotChunk::new();
+                chunk.set_data(buf);
+                Ok(Async::Ready(
+                    Some((chunk, WriteFlags::default().buffer_hint(true))),
+                ))
             }
-            Err(e) => Some(Err(e)),
+            Err(e) => Err(box_err!("failed to read snapshot chunk: {}", e)),
         }
     }
 }
@@ -104,19 +107,20 @@ impl Iterator for SnapChunk {
 /// Send the snapshot to specified address.
 ///
 /// It will first send the normal raft snapshot message and then send the snapshot file.
-fn send_snap(env: Arc<Environment>,
-             mgr: SnapManager,
-             addr: SocketAddr,
-             msg: RaftMessage)
-             -> Result<()> {
+fn send_snap(
+    env: Arc<Environment>,
+    mgr: SnapManager,
+    addr: SocketAddr,
+    msg: RaftMessage,
+) -> Result<()> {
     assert!(msg.get_message().has_snapshot());
     let timer = Instant::now();
 
-    let send_timer = SEND_SNAP_HISTOGRAM.start_timer();
+    let send_timer = SEND_SNAP_HISTOGRAM.start_coarse_timer();
 
     let key = {
         let snap = msg.get_message().get_snapshot();
-        try!(SnapKey::from_snap(snap))
+        SnapKey::from_snap(snap)?
     };
     mgr.register(key.clone(), SnapEntry::Sending);
     defer!({
@@ -126,7 +130,7 @@ fn send_snap(env: Arc<Environment>,
     if !s.exists() {
         return Err(box_err!("missing snap file: {:?}", s.path()));
     }
-    let total_size = try!(s.total_size());
+    let total_size = s.total_size()?;
 
     // snapshot file has been validated when created, so no need to validate again.
     let s = Arc::new(RwLock::new(s));
@@ -136,33 +140,27 @@ fn send_snap(env: Arc<Environment>,
             snap: s.clone(),
             remain_bytes: total_size as usize,
         };
-        let first: Once<Result<(SnapshotChunk, _)>> = iter::once({
+        let first: Once<(SnapshotChunk, _), Error> = stream::once({
             let mut chunk = SnapshotChunk::new();
             chunk.set_message(msg);
-            Ok((chunk, WriteFlags::default()))
+            Ok((chunk, WriteFlags::default().buffer_hint(true)))
         });
-        let rests = snap_chunk.map(|item| {
-            item.map(|buf| {
-                    let mut chunk = SnapshotChunk::new();
-                    chunk.set_data(buf);
-                    (chunk, WriteFlags::default())
-                })
-                .map_err(|e| box_err!("failed to read snapshot chunk: {}", e))
-        });
-        first.chain(rests)
+        first.chain(snap_chunk)
     };
 
     let channel = ChannelBuilder::new(env).connect(&format!("{}", addr));
     let client = TikvClient::new(channel);
     let (sink, receiver) = client.snapshot();
-    let send = stream::iter(chunks.into_iter()).forward(sink);
+    let send = chunks.forward(sink);
     let res = send.and_then(|_| receiver.map_err(Error::from))
         .and_then(|_| {
-            info!("[region {}] sent snapshot {} [size: {}, dur: {:?}]",
-                  key.region_id,
-                  key,
-                  total_size,
-                  timer.elapsed());
+            info!(
+                "[region {}] sent snapshot {} [size: {}, dur: {:?}]",
+                key.region_id,
+                key,
+                total_size,
+                timer.elapsed()
+            );
             s.wl().delete();
             Ok(())
         })
@@ -177,7 +175,7 @@ pub struct Runner<R: RaftStoreRouter + 'static> {
     env: Arc<Environment>,
     snap_mgr: SnapManager,
     files: HashMap<Token, (Box<Snapshot>, RaftMessage)>,
-    pool: ThreadPool,
+    pool: ThreadPool<DefaultContext>,
     raft_router: R,
 }
 
@@ -187,7 +185,9 @@ impl<R: RaftStoreRouter + 'static> Runner<R> {
             env: env,
             snap_mgr: snap_mgr,
             files: map![],
-            pool: ThreadPool::new_with_name(thd_name!("snap sender"), DEFAULT_SENDER_POOL_SIZE),
+            pool: ThreadPoolBuilder::with_default_factory(thd_name!("snap sender"))
+                .thread_count(DEFAULT_SENDER_POOL_SIZE)
+                .build(),
             raft_router: r,
         }
     }
@@ -206,12 +206,16 @@ impl<R: RaftStoreRouter + 'static> Runnable<Task> for Runner<R> {
                         return;
                     }
                 };
-                match mgr.get_snapshot_for_receiving(&key,
-                                                     meta.get_message().get_snapshot().get_data()) {
+                match mgr.get_snapshot_for_receiving(
+                    &key,
+                    meta.get_message().get_snapshot().get_data(),
+                ) {
                     Ok(snap) => {
                         if snap.exists() {
-                            info!("snapshot file {} already exists, skip receiving.",
-                                  snap.path());
+                            info!(
+                                "snapshot file {} already exists, skip receiving.",
+                                snap.path()
+                            );
                             if let Err(e) = self.raft_router.send_raft_msg(meta) {
                                 error!("send snapshot for key {} token {:?}: {:?}", key, token, e);
                             }
@@ -222,9 +226,11 @@ impl<R: RaftStoreRouter + 'static> Runnable<Task> for Runner<R> {
                         self.files.insert(token, (snap, meta));
                     }
                     Err(e) => {
-                        error!("failed to create snapshot file for token {:?}: {:?}",
-                               token,
-                               e);
+                        error!(
+                            "failed to create snapshot file for token {:?}: {:?}",
+                            token,
+                            e
+                        );
                         return;
                     }
                 }
@@ -234,10 +240,12 @@ impl<R: RaftStoreRouter + 'static> Runnable<Task> for Runner<R> {
                 match self.files.entry(token) {
                     Entry::Occupied(mut e) => {
                         if let Err(err) = data.write_all_to(&mut e.get_mut().0) {
-                            error!("failed to write data to snapshot file {} for token {:?}: {:?}",
-                                   e.get_mut().0.path(),
-                                   token,
-                                   err);
+                            error!(
+                                "failed to write data to snapshot file {} for token {:?}: {:?}",
+                                e.get_mut().0.path(),
+                                token,
+                                err
+                            );
                             let (_, msg) = e.remove();
                             let key = SnapKey::from_snap(msg.get_message().get_snapshot()).unwrap();
                             self.snap_mgr.deregister(&key, &SnapEntry::Receiving);
@@ -256,10 +264,12 @@ impl<R: RaftStoreRouter + 'static> Runnable<Task> for Runner<R> {
                             self.snap_mgr.deregister(&key, &SnapEntry::Receiving);
                         });
                         if let Err(e) = snap.save() {
-                            error!("failed to save snapshot file {} for token {:?}: {:?}",
-                                   snap.path(),
-                                   token,
-                                   e);
+                            error!(
+                                "failed to save snapshot file {} for token {:?}: {:?}",
+                                snap.path(),
+                                token,
+                                e
+                            );
                             return;
                         }
                         if let Err(e) = self.raft_router.send_raft_msg(msg) {
@@ -282,7 +292,7 @@ impl<R: RaftStoreRouter + 'static> Runnable<Task> for Runner<R> {
                 SNAP_TASK_COUNTER.with_label_values(&["send"]).inc();
                 let env = self.env.clone();
                 let mgr = self.snap_mgr.clone();
-                self.pool.execute(move || {
+                self.pool.execute(move |_| {
                     let res = send_snap(env, mgr, addr, msg);
                     if res.is_err() {
                         error!("failed to send snap to {}: {:?}", addr, res);

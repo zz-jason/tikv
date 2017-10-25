@@ -12,7 +12,7 @@
 // limitations under the License.
 
 
-use std::{thread, error, io};
+use std::{error, io, thread};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::mpsc;
@@ -46,7 +46,7 @@ quick_error! {
 impl<T: Debug> From<NotifyError<T>> for Error {
     fn from(e: NotifyError<T>) -> Error {
         match e {
-            // ALLERT!! May cause sensitive data leak.
+            // ALERT!! May cause sensitive data leak.
             NotifyError::Full(m) => Error::Discard(format!("Failed to send {:?} due to full", m)),
             NotifyError::Closed(..) => Error::Closed,
             _ => box_err!("{:?}", e),
@@ -86,7 +86,7 @@ impl<T> Sender<T> for mpsc::SyncSender<T> {
     }
 }
 
-/// A channel that handle error with retry automatically.
+/// A channel that handles errors with retry automatically.
 pub struct RetryableSendCh<T, C> {
     ch: C,
     name: &'static str,
@@ -123,7 +123,9 @@ impl<T: Debug, C: Sender<T>> RetryableSendCh<T, C> {
                 Ok(_) => return Ok(()),
                 Err(NotifyError::Full(m)) => {
                     if try_times <= 1 {
-                        CHANNEL_FULL_COUNTER_VEC.with_label_values(&[self.name]).inc();
+                        CHANNEL_FULL_COUNTER_VEC
+                            .with_label_values(&[self.name])
+                            .inc();
                         return Err(NotifyError::Full(m).into());
                     }
                     try_times -= 1;
@@ -132,7 +134,7 @@ impl<T: Debug, C: Sender<T>> RetryableSendCh<T, C> {
                 Err(e) => return Err(e.into()),
             };
 
-            // ALLERT!! make cause sensitive data leak.
+            // ALERT!! make cause sensitive data leak.
             warn!("notify queue is full, sleep and retry sending {:?}", t);
             thread::sleep(Duration::from_millis(100));
         }
@@ -158,7 +160,7 @@ mod tests {
     use std::sync::mpsc::Receiver;
     use std::time::Duration;
 
-    use mio::{EventLoop, Handler, EventLoopConfig};
+    use mio::{EventLoop, EventLoopConfig, Handler};
 
     use super::*;
 

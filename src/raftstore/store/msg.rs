@@ -19,10 +19,10 @@ use kvproto::raft_serverpb::RaftMessage;
 use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse};
 use kvproto::metapb::RegionEpoch;
 use raft::SnapshotStatus;
-
 use util::escape;
 
 pub type Callback = Box<FnBox(RaftCmdResponse) + Send>;
+pub type BatchCallback = Box<FnBox(Vec<Option<RaftCmdResponse>>) + Send>;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Tick {
@@ -35,13 +35,16 @@ pub enum Tick {
     SnapGc,
     CompactLockCf,
     ConsistencyCheck,
-    ReportRegionFlow,
 }
 
-pub struct SnapshotStatusMsg {
-    pub region_id: u64,
-    pub to_peer_id: u64,
-    pub status: SnapshotStatus,
+#[derive(Debug, PartialEq)]
+pub enum SignificantMsg {
+    SnapshotStatus {
+        region_id: u64,
+        to_peer_id: u64,
+        status: SnapshotStatus,
+    },
+    Unreachable { region_id: u64, to_peer_id: u64 },
 }
 
 pub enum Msg {
@@ -56,14 +59,20 @@ pub enum Msg {
         callback: Callback,
     },
 
-    // For split check
-    SplitCheckResult {
-        region_id: u64,
-        epoch: RegionEpoch,
-        split_key: Vec<u8>,
+    BatchRaftSnapCmds {
+        send_time: Instant,
+        batch: Vec<RaftCmdRequest>,
+        on_finished: BatchCallback,
     },
 
-    ReportUnreachable { region_id: u64, to_peer_id: u64 },
+    SplitRegion {
+        region_id: u64,
+        region_epoch: RegionEpoch,
+        // It's an encoded key.
+        // TODO: support meta key.
+        split_key: Vec<u8>,
+        callback: Option<Callback>,
+    },
 
     // For snapshot stats.
     SnapshotStats,
@@ -74,6 +83,9 @@ pub enum Msg {
         index: u64,
         hash: Vec<u8>,
     },
+
+    // For region size
+    ApproximateRegionSize { region_id: u64, region_size: u64 },
 }
 
 impl fmt::Debug for Msg {
@@ -82,21 +94,33 @@ impl fmt::Debug for Msg {
             Msg::Quit => write!(fmt, "Quit"),
             Msg::RaftMessage(_) => write!(fmt, "Raft Message"),
             Msg::RaftCmd { .. } => write!(fmt, "Raft Command"),
-            Msg::SplitCheckResult { .. } => write!(fmt, "Split Check Result"),
-            Msg::ReportUnreachable { ref region_id, ref to_peer_id } => {
-                write!(fmt,
-                       "peer {} for region {} is unreachable",
-                       to_peer_id,
-                       region_id)
-            }
+            Msg::BatchRaftSnapCmds { .. } => write!(fmt, "Batch Raft Commands"),
             Msg::SnapshotStats => write!(fmt, "Snapshot stats"),
-            Msg::ComputeHashResult { region_id, index, ref hash } => {
-                write!(fmt,
-                       "ComputeHashResult [region_id: {}, index: {}, hash: {}]",
-                       region_id,
-                       index,
-                       escape(hash))
-            }
+            Msg::ComputeHashResult {
+                region_id,
+                index,
+                ref hash,
+            } => write!(
+                fmt,
+                "ComputeHashResult [region_id: {}, index: {}, hash: {}]",
+                region_id,
+                index,
+                escape(hash)
+            ),
+            Msg::SplitRegion {
+                ref region_id,
+                ref split_key,
+                ..
+            } => write!(fmt, "Split region {} at key {:?}", region_id, split_key),
+            Msg::ApproximateRegionSize {
+                region_id,
+                region_size,
+            } => write!(
+                fmt,
+                "Approximate region size [region_id: {}, region_size: {}]",
+                region_id,
+                region_size
+            ),
         }
     }
 }
@@ -107,6 +131,17 @@ impl Msg {
             send_time: Instant::now(),
             request: request,
             callback: callback,
+        }
+    }
+
+    pub fn new_batch_raft_snapshot_cmd(
+        batch: Vec<RaftCmdRequest>,
+        on_finished: BatchCallback,
+    ) -> Msg {
+        Msg::BatchRaftSnapCmds {
+            send_time: Instant::now(),
+            batch: batch,
+            on_finished: on_finished,
         }
     }
 }
@@ -124,15 +159,19 @@ mod tests {
     use raftstore::Error;
     use util::transport::SendCh;
 
-    fn call_command(sendch: &SendCh<Msg>,
-                    request: RaftCmdRequest,
-                    timeout: Duration)
-                    -> Result<RaftCmdResponse, Error> {
-        wait_op!(|cb: Box<FnBox(RaftCmdResponse) + 'static + Send>| {
-                     sendch.try_send(Msg::new_raft_cmd(request, cb)).unwrap()
-                 },
-                 timeout)
-            .ok_or_else(|| Error::Timeout(format!("request timeout for {:?}", timeout)))
+    fn call_command(
+        sendch: &SendCh<Msg>,
+        request: RaftCmdRequest,
+        timeout: Duration,
+    ) -> Result<RaftCmdResponse, Error> {
+        wait_op!(
+            |cb: Box<FnBox(RaftCmdResponse) + 'static + Send>| {
+                sendch.try_send(Msg::new_raft_cmd(request, cb)).unwrap()
+            },
+            timeout
+        ).ok_or_else(|| {
+            Error::Timeout(format!("request timeout for {:?}", timeout))
+        })
     }
 
     struct TestHandler;
@@ -144,7 +183,9 @@ mod tests {
         fn notify(&mut self, event_loop: &mut EventLoop<Self>, msg: Self::Message) {
             match msg {
                 Msg::Quit => event_loop.shutdown(),
-                Msg::RaftCmd { callback, request, .. } => {
+                Msg::RaftCmd {
+                    callback, request, ..
+                } => {
                     // a trick for test timeout.
                     if request.get_header().get_region_id() == u64::max_value() {
                         thread::sleep(Duration::from_millis(100));
@@ -162,9 +203,7 @@ mod tests {
         let mut event_loop = EventLoop::new().unwrap();
         let sendch = &SendCh::new(event_loop.channel(), "test-sender");
 
-        let t = thread::spawn(move || {
-            event_loop.run(&mut TestHandler).unwrap();
-        });
+        let t = thread::spawn(move || { event_loop.run(&mut TestHandler).unwrap(); });
 
         let mut request = RaftCmdRequest::new();
         request.mut_header().set_region_id(u64::max_value());

@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use prometheus::{Counter, CounterVec, Gauge, HistogramVec, exponential_buckets};
+use prometheus::*;
 
 lazy_static! {
     pub static ref KV_COMMAND_COUNTER_VEC: CounterVec =
@@ -26,6 +26,12 @@ lazy_static! {
             "tikv_scheduler_stage_total",
             "Total number of commands on each stage.",
             &["type", "stage"]
+        ).unwrap();
+
+    pub static ref SCHED_WRITING_KV_GAUGE: Gauge =
+        register_gauge!(
+            "tikv_scheduler_writing_kv_total",
+            "Total number of writing kv."
         ).unwrap();
 
     pub static ref SCHED_CONTEX_GAUGE: Gauge =
@@ -79,12 +85,11 @@ lazy_static! {
             exponential_buckets(1.0, 2.0, 21).unwrap()
         ).unwrap();
 
-    pub static ref KV_COMMAND_SCAN_DETAILS: HistogramVec =
-        register_histogram_vec!(
-            "tikv_scheudler_kv_scan_details",
-            "Bucketed histogram of kv keys scan details for each cf",
-            &["cf","tag"],
-              exponential_buckets(1.0, 2.0, 20).unwrap()
+    pub static ref KV_COMMAND_SCAN_DETAILS: CounterVec =
+        register_counter_vec!(
+            "tikv_scheduler_kv_scan_details",
+            "Bucketed counter of kv keys scan details for each cf",
+            &["req","cf","tag"]
         ).unwrap();
 
     pub static ref RAWKV_COMMAND_COUNTER_VEC: CounterVec =
@@ -104,5 +109,22 @@ lazy_static! {
         register_counter!(
             "tikv_storage_gc_skipped_counter",
             "Total number of gc command skipped owing to optimization"
+        ).unwrap();
+
+    pub static ref BATCH_COMMANDS: HistogramVec =
+        register_histogram_vec!(
+            "tikv_storage_batch_commands_total",
+            "Bucketed histogram of total number of a batch of commands",
+            &["type"],
+            vec![1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0,
+            20.0, 24.0, 28.0, 32.0, 48.0, 64.0, 96.0, 128.0, 192.0, 256.0]
+        ).unwrap();
+
+    pub static ref KV_COMMAND_KEYWRITE_HISTOGRAM_VEC: HistogramVec =
+        register_histogram_vec!(
+            "tikv_scheduler_kv_command_key_write",
+            "Bucketed histogram of keys write of a kv command",
+            &["type"],
+            exponential_buckets(1.0, 2.0, 21).unwrap()
         ).unwrap();
 }

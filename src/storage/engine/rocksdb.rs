@@ -11,22 +11,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt::{self, Formatter, Debug, Display};
+use std::ops::Deref;
+use std::fmt::{self, Debug, Display, Formatter};
 use std::sync::{Arc, Mutex};
-use rocksdb::{DB, Writable, SeekKey, WriteBatch, DBIterator};
+use rocksdb::{DBIterator, SeekKey, Writable, WriteBatch, DB};
 use kvproto::kvrpcpb::Context;
-use storage::{Key, Value, CfName, CF_DEFAULT};
-use raftstore::store::engine::{SyncSnapshot as RocksSnapshot, Peekable, Iterable, IterOption};
+use storage::{CfName, Key, Value, CF_DEFAULT};
+use raftstore::store::engine::{IterOption, Iterable, Peekable, SyncSnapshot as RocksSnapshot};
 use util::escape;
 use util::rocksdb;
-use util::worker::{Runnable, Worker, Scheduler};
-use super::{Engine, Snapshot, Modify, Cursor, Iterator as EngineIterator, Callback, TEMP_DIR,
-            ScanMode, Result, Error, CbContext};
+use util::worker::{Runnable, Scheduler, Worker};
+use super::{BatchCallback, Callback, CbContext, Cursor, Engine, Error, Iterator as EngineIterator,
+            Modify, Result, ScanMode, Snapshot, TEMP_DIR};
 use tempdir::TempDir;
 
 enum Task {
     Write(Vec<Modify>, Callback<()>),
     Snapshot(Callback<Box<Snapshot>>),
+    SnapshotBath(usize, BatchCallback<Box<Snapshot>>),
 }
 
 impl Display for Task {
@@ -34,6 +36,7 @@ impl Display for Task {
         match *self {
             Task::Write(..) => write!(f, "write task"),
             Task::Snapshot(_) => write!(f, "snapshot task"),
+            Task::SnapshotBath(..) => write!(f, "snapshot task batch"),
         }
     }
 }
@@ -44,8 +47,20 @@ impl Runnable<Task> for Runner {
     fn run(&mut self, t: Task) {
         match t {
             Task::Write(modifies, cb) => cb((CbContext::new(), write_modifies(&self.0, modifies))),
-            Task::Snapshot(cb) => {
-                cb((CbContext::new(), Ok(box RocksSnapshot::new(self.0.clone()))))
+            Task::Snapshot(cb) => cb((
+                CbContext::new(),
+                Ok(box RocksSnapshot::new(self.0.clone())),
+            )),
+            Task::SnapshotBath(size, on_finished) => {
+                let mut results = Vec::with_capacity(size);
+                for _ in 0..size {
+                    let res = Some((
+                        CbContext::new(),
+                        Ok(box RocksSnapshot::new(self.0.clone()) as Box<Snapshot>),
+                    ));
+                    results.push(res);
+                }
+                on_finished(results);
             }
         }
     }
@@ -81,7 +96,7 @@ impl EngineRocksdb {
             _ => (path.to_owned(), None),
         };
         let mut worker = Worker::new("engine-rocksdb");
-        let db = try!(rocksdb::new_engine(&path, cfs));
+        let db = rocksdb::new_engine(&path, cfs)?;
         box_try!(worker.start(Runner(Arc::new(db))));
         Ok(EngineRocksdb {
             sched: worker.scheduler(),
@@ -91,13 +106,22 @@ impl EngineRocksdb {
             })),
         })
     }
+
+    pub fn stop(&self) {
+        let mut core = self.core.lock().unwrap();
+        if let Some(h) = core.worker.stop() {
+            h.join().unwrap();
+        }
+    }
 }
 
 impl Debug for EngineRocksdb {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f,
-               "Rocksdb [is_temp: {}]",
-               self.core.lock().unwrap().temp_dir.is_some())
+        write!(
+            f,
+            "Rocksdb [is_temp: {}]",
+            self.core.lock().unwrap().temp_dir.is_some()
+        )
     }
 }
 
@@ -105,25 +129,31 @@ fn write_modifies(db: &DB, modifies: Vec<Modify>) -> Result<()> {
     let wb = WriteBatch::new();
     for rev in modifies {
         let res = match rev {
-            Modify::Delete(cf, k) => {
-                if cf == CF_DEFAULT {
-                    trace!("EngineRocksdb: delete {}", k);
-                    wb.delete(k.encoded())
-                } else {
-                    trace!("EngineRocksdb: delete_cf {} {}", cf, k);
-                    let handle = try!(rocksdb::get_cf_handle(db, cf));
-                    wb.delete_cf(handle, k.encoded())
-                }
-            }
-            Modify::Put(cf, k, v) => {
-                if cf == CF_DEFAULT {
-                    trace!("EngineRocksdb: put {},{}", k, escape(&v));
-                    wb.put(k.encoded(), &v)
-                } else {
-                    trace!("EngineRocksdb: put_cf {}, {}, {}", cf, k, escape(&v));
-                    let handle = try!(rocksdb::get_cf_handle(db, cf));
-                    wb.put_cf(handle, k.encoded(), &v)
-                }
+            Modify::Delete(cf, k) => if cf == CF_DEFAULT {
+                trace!("EngineRocksdb: delete {}", k);
+                wb.delete(k.encoded())
+            } else {
+                trace!("EngineRocksdb: delete_cf {} {}", cf, k);
+                let handle = rocksdb::get_cf_handle(db, cf)?;
+                wb.delete_cf(handle, k.encoded())
+            },
+            Modify::Put(cf, k, v) => if cf == CF_DEFAULT {
+                trace!("EngineRocksdb: put {},{}", k, escape(&v));
+                wb.put(k.encoded(), &v)
+            } else {
+                trace!("EngineRocksdb: put_cf {}, {}, {}", cf, k, escape(&v));
+                let handle = rocksdb::get_cf_handle(db, cf)?;
+                wb.put_cf(handle, k.encoded(), &v)
+            },
+            Modify::DeleteRange(cf, start_key, end_key) => {
+                trace!(
+                    "EngineRocksdb: delete_range_cf {}, {}, {}",
+                    cf,
+                    escape(start_key.encoded()),
+                    escape(end_key.encoded())
+                );
+                let handle = rocksdb::get_cf_handle(db, cf)?;
+                wb.delete_range_cf(handle, start_key.encoded(), end_key.encoded())
             }
         };
         if let Err(msg) = res {
@@ -144,6 +174,18 @@ impl Engine for EngineRocksdb {
 
     fn async_snapshot(&self, _: &Context, cb: Callback<Box<Snapshot>>) -> Result<()> {
         box_try!(self.sched.schedule(Task::Snapshot(cb)));
+        Ok(())
+    }
+
+    fn async_batch_snapshot(
+        &self,
+        batch: Vec<Context>,
+        on_finished: BatchCallback<Box<Snapshot>>,
+    ) -> Result<()> {
+        box_try!(
+            self.sched
+                .schedule(Task::SnapshotBath(batch.len(), on_finished))
+        );
         Ok(())
     }
 
@@ -175,13 +217,14 @@ impl Snapshot for RocksSnapshot {
     }
 
     #[allow(needless_lifetimes)]
-    fn iter_cf<'b>(&'b self,
-                   cf: CfName,
-                   iter_opt: IterOption,
-                   mode: ScanMode)
-                   -> Result<Cursor<'b>> {
+    fn iter_cf<'b>(
+        &'b self,
+        cf: CfName,
+        iter_opt: IterOption,
+        mode: ScanMode,
+    ) -> Result<Cursor<'b>> {
         trace!("RocksSnapshot: create cf iterator");
-        Ok(Cursor::new(try!(self.new_iterator_cf(cf, iter_opt)), mode))
+        Ok(Cursor::new(self.new_iterator_cf(cf, iter_opt)?, mode))
     }
 
     fn clone(&self) -> Box<Snapshot> {
@@ -189,7 +232,7 @@ impl Snapshot for RocksSnapshot {
     }
 }
 
-impl<'a> EngineIterator for DBIterator<'a> {
+impl<D: Deref<Target = DB>> EngineIterator for DBIterator<D> {
     fn next(&mut self) -> bool {
         DBIterator::next(self)
     }
@@ -203,7 +246,10 @@ impl<'a> EngineIterator for DBIterator<'a> {
     }
 
     fn seek_for_prev(&mut self, key: &Key) -> Result<bool> {
-        Ok(DBIterator::seek_for_prev(self, key.encoded().as_slice().into()))
+        Ok(DBIterator::seek_for_prev(
+            self,
+            key.encoded().as_slice().into(),
+        ))
     }
 
     fn seek_to_first(&mut self) -> bool {

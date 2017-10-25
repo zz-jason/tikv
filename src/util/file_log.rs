@@ -11,9 +11,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::{SystemTime, Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::{self, Timespec, Tm};
-use std::fs::{self, OpenOptions, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::fmt::Arguments;
 use std::path::Path;
@@ -52,12 +52,9 @@ fn open_log_file(path: &str) -> io::Result<File> {
     let p = Path::new(path);
     let parent = p.parent().unwrap();
     if !parent.is_dir() {
-        try!(fs::create_dir_all(parent))
+        fs::create_dir_all(parent)?
     }
-    OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path)
+    OpenOptions::new().append(true).create(true).open(path)
 }
 
 struct RotatingFileLoggerCore {
@@ -68,7 +65,7 @@ struct RotatingFileLoggerCore {
 
 impl RotatingFileLoggerCore {
     fn new(path: &str) -> io::Result<RotatingFileLoggerCore> {
-        let file = try!(open_log_file(path));
+        let file = open_log_file(path)?;
         let file_attr = fs::metadata(path).unwrap();
         let file_modified_time = file_attr.modified().unwrap();
         let rollover_time = compute_rollover_time(systemtime_to_tm(file_modified_time));
@@ -92,7 +89,10 @@ impl RotatingFileLoggerCore {
         self.close();
         let mut s = self.file_path.clone();
         s.push_str(".");
-        s.push_str(&time::strftime("%Y%m%d", &one_day_before(self.rollover_time)).unwrap());
+        s.push_str(&time::strftime(
+            "%Y%m%d",
+            &one_day_before(self.rollover_time),
+        ).unwrap());
         fs::rename(&self.file_path, &s).unwrap();
         self.update_rollover_time();
         self.open()
@@ -115,8 +115,10 @@ pub struct RotatingFileLogger {
 
 impl RotatingFileLogger {
     pub fn new(file_path: &str) -> io::Result<RotatingFileLogger> {
-        let core = try!(RotatingFileLoggerCore::new(file_path));
-        let ret = RotatingFileLogger { core: Mutex::new(core) };
+        let core = RotatingFileLoggerCore::new(file_path)?;
+        let ret = RotatingFileLogger {
+            core: Mutex::new(core),
+        };
         Ok(ret)
     }
 }
@@ -141,14 +143,14 @@ impl Drop for RotatingFileLogger {
 
 #[cfg(test)]
 mod tests {
-    extern crate log;
-    extern crate rand;
-    extern crate utime;
     use time::{self, Timespec};
     use std::io::prelude::*;
     use std::fs::OpenOptions;
     use std::path::Path;
+
     use tempdir::TempDir;
+    use utime;
+
     use super::{RotatingFileLoggerCore, ONE_DAY_SECONDS};
 
     #[test]
@@ -166,8 +168,12 @@ mod tests {
     #[test]
     fn test_rotating_file_logger() {
         let tmp_dir = TempDir::new("").unwrap();
-        let log_file =
-            tmp_dir.path().join("test_rotating_file_logger.log").to_str().unwrap().to_string();
+        let log_file = tmp_dir
+            .path()
+            .join("test_rotating_file_logger.log")
+            .to_str()
+            .unwrap()
+            .to_string();
         // create a file with mtime == one day ago
         {
             let mut file = OpenOptions::new()

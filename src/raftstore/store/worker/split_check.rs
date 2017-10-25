@@ -12,7 +12,7 @@
 // limitations under the License.
 
 use std::sync::Arc;
-use std::fmt::{self, Formatter, Display};
+use std::fmt::{self, Display, Formatter};
 use std::collections::BinaryHeap;
 use std::cmp::Ordering;
 
@@ -22,7 +22,8 @@ use kvproto::metapb::RegionEpoch;
 use kvproto::metapb::Region;
 
 use raftstore::store::{keys, Msg};
-use raftstore::store::engine::{Iterable, IterOption};
+use raftstore::store::engine::{IterOption, Iterable};
+use raftstore::store::util;
 use raftstore::Result;
 use rocksdb::DBIterator;
 use util::escape;
@@ -60,7 +61,13 @@ impl KeyEntry {
 impl PartialOrd for KeyEntry {
     fn partial_cmp(&self, rhs: &KeyEntry) -> Option<Ordering> {
         // BinaryHeap is max heap, so we have to reverse order to get a min heap.
-        Some(self.key.as_ref().unwrap().cmp(rhs.key.as_ref().unwrap()).reverse())
+        Some(
+            self.key
+                .as_ref()
+                .unwrap()
+                .cmp(rhs.key.as_ref().unwrap())
+                .reverse(),
+        )
     }
 }
 
@@ -71,22 +78,23 @@ impl Ord for KeyEntry {
 }
 
 struct MergedIterator<'a> {
-    iters: Vec<DBIterator<'a>>,
+    iters: Vec<DBIterator<&'a DB>>,
     heap: BinaryHeap<KeyEntry>,
 }
 
 impl<'a> MergedIterator<'a> {
-    fn new(db: &'a DB,
-           cfs: &[CfName],
-           start_key: &[u8],
-           end_key: &[u8],
-           fill_cache: bool)
-           -> Result<MergedIterator<'a>> {
+    fn new(
+        db: &'a DB,
+        cfs: &[CfName],
+        start_key: &[u8],
+        end_key: &[u8],
+        fill_cache: bool,
+    ) -> Result<MergedIterator<'a>> {
         let mut iters = Vec::with_capacity(cfs.len());
         let mut heap = BinaryHeap::with_capacity(cfs.len());
         for (pos, cf) in cfs.into_iter().enumerate() {
             let iter_opt = IterOption::new(Some(end_key.to_vec()), fill_cache);
-            let mut iter = try!(db.new_iterator_cf(cf, iter_opt));
+            let mut iter = db.new_iterator_cf(cf, iter_opt)?;
             if iter.seek(start_key.into()) {
                 heap.push(KeyEntry::new(iter.key().to_vec(), pos, iter.value().len()));
             }
@@ -119,26 +127,20 @@ impl<'a> MergedIterator<'a> {
 
 /// Split checking task.
 pub struct Task {
-    region_id: u64,
-    epoch: RegionEpoch,
-    start_key: Vec<u8>,
-    end_key: Vec<u8>,
+    region: Region,
 }
 
 impl Task {
     pub fn new(region: &Region) -> Task {
         Task {
-            region_id: region.get_id(),
-            epoch: region.get_region_epoch().clone(),
-            start_key: keys::enc_start_key(region),
-            end_key: keys::enc_end_key(region),
+            region: region.clone(),
         }
     }
 }
 
 impl Display for Task {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "Split Check Task for {}", self.region_id)
+        write!(f, "Split Check Task for {}", self.region.get_id())
     }
 }
 
@@ -149,12 +151,13 @@ pub struct Runner<C> {
     split_size: u64,
 }
 
-impl<C> Runner<C> {
-    pub fn new(engine: Arc<DB>,
-               ch: RetryableSendCh<Msg, C>,
-               region_max_size: u64,
-               split_size: u64)
-               -> Runner<C> {
+impl<C: Sender<Msg>> Runner<C> {
+    pub fn new(
+        engine: Arc<DB>,
+        ch: RetryableSendCh<Msg, C>,
+        region_max_size: u64,
+        split_size: u64,
+    ) -> Runner<C> {
         Runner {
             engine: engine,
             ch: ch,
@@ -162,90 +165,151 @@ impl<C> Runner<C> {
             split_size: split_size,
         }
     }
-}
 
-impl<C: Sender<Msg>> Runnable<Task> for Runner<C> {
-    fn run(&mut self, task: Task) {
-        debug!("[region {}] executing task {} {}",
-               task.region_id,
-               escape(&task.start_key),
-               escape(&task.end_key));
+    fn check_size(&mut self, region: &Region) -> Option<u64> {
+        let region_id = region.get_id();
+        let region_size = match util::get_region_approximate_size(&self.engine, region) {
+            Ok(size) => size,
+            Err(e) => {
+                error!(
+                    "[region {}] failed to get approximate size: {}",
+                    region_id,
+                    e
+                );
+                return None;
+            }
+        };
+
+        let res = Msg::ApproximateRegionSize {
+            region_id: region_id,
+            region_size: region_size,
+        };
+        if let Err(e) = self.ch.try_send(res) {
+            error!(
+                "[region {}] failed to send approximate region size: {}",
+                region_id,
+                e
+            );
+        }
+
+        REGION_SIZE_HISTOGRAM.observe(region_size as f64);
+        Some(region_size)
+    }
+
+    fn check_split(&mut self, region: &Region) {
+        let region_id = region.get_id();
+        let start_key = keys::enc_start_key(region);
+        let end_key = keys::enc_end_key(region);
+        debug!(
+            "[region {}] executing task {} {}",
+            region_id,
+            escape(&start_key),
+            escape(&end_key)
+        );
         CHECK_SPILT_COUNTER_VEC.with_label_values(&["all"]).inc();
 
         let mut size = 0;
         let mut split_key = vec![];
-        let timer = CHECK_SPILT_HISTOGRAM.start_timer();
-        let res = MergedIterator::new(self.engine.as_ref(),
-                                      LARGE_CFS,
-                                      &task.start_key,
-                                      &task.end_key,
-                                      false)
-            .map(|mut iter| {
-                while let Some(e) = iter.next() {
-                    size += e.len() as u64;
-                    if split_key.is_empty() && size > self.split_size {
-                        split_key = e.key.unwrap();
-                    }
-                    if size >= self.region_max_size {
-                        break;
-                    }
+        let timer = CHECK_SPILT_HISTOGRAM.start_coarse_timer();
+        let res = MergedIterator::new(self.engine.as_ref(), LARGE_CFS, &start_key, &end_key, false)
+            .map(|mut iter| while let Some(e) = iter.next() {
+                size += e.len() as u64;
+                if split_key.is_empty() && size > self.split_size {
+                    split_key = e.key.unwrap();
+                }
+                if size >= self.region_max_size {
+                    break;
                 }
             });
 
         if let Err(e) = res {
-            error!("failed to scan split key of region {}: {:?}",
-                   task.region_id,
-                   e);
+            error!("[region {}] failed to scan split key: {}", region_id, e);
             return;
         }
 
         timer.observe_duration();
 
         if size < self.region_max_size {
-            debug!("[region {}] no need to send for {} < {}",
-                   task.region_id,
-                   size,
-                   self.region_max_size);
+            debug!(
+                "[region {}] no need to send for {} < {}",
+                region_id,
+                size,
+                self.region_max_size
+            );
 
             CHECK_SPILT_COUNTER_VEC.with_label_values(&["ignore"]).inc();
             return;
         }
-        let res = self.ch.try_send(new_split_check_result(task.region_id, task.epoch, split_key));
+
+        let region_epoch = region.get_region_epoch().clone();
+        let res = self.ch
+            .try_send(new_split_region(region_id, region_epoch, split_key));
         if let Err(e) = res {
-            warn!("[region {}] failed to send check result, err {:?}",
-                  task.region_id,
-                  e);
+            warn!("[region {}] failed to send check result: {}", region_id, e);
         }
 
-        CHECK_SPILT_COUNTER_VEC.with_label_values(&["success"]).inc();
+        CHECK_SPILT_COUNTER_VEC
+            .with_label_values(&["success"])
+            .inc();
     }
 }
 
-fn new_split_check_result(region_id: u64, epoch: RegionEpoch, split_key: Vec<u8>) -> Msg {
-    Msg::SplitCheckResult {
+impl<C: Sender<Msg>> Runnable<Task> for Runner<C> {
+    fn run(&mut self, task: Task) {
+        let region = &task.region;
+        if let Some(region_size) = self.check_size(region) {
+            if region_size < self.region_max_size {
+                return;
+            }
+            info!(
+                "[region {}] approximate size {} >= {}, need to do split check",
+                region.get_id(),
+                region_size,
+                self.region_max_size
+            );
+        }
+        self.check_split(region);
+    }
+}
+
+fn new_split_region(region_id: u64, epoch: RegionEpoch, split_key: Vec<u8>) -> Msg {
+    let key = keys::origin_key(split_key.as_slice()).to_vec();
+    Msg::SplitRegion {
         region_id: region_id,
-        epoch: epoch,
-        split_key: split_key,
+        region_epoch: epoch,
+        split_key: key,
+        callback: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc::{self, TryRecvError};
+    use std::sync::mpsc;
     use std::sync::Arc;
 
     use tempdir::TempDir;
     use rocksdb::Writable;
     use kvproto::metapb::Peer;
+    use rocksdb::{ColumnFamilyOptions, DBOptions};
 
     use storage::ALL_CFS;
-    use util::rocksdb;
+    use util::rocksdb::{new_engine_opt, CFOptions};
+    use util::properties::SizePropertiesCollectorFactory;
     use super::*;
 
     #[test]
     fn test_split_check() {
         let path = TempDir::new("test-raftstore").unwrap();
-        let engine = Arc::new(rocksdb::new_engine(path.path().to_str().unwrap(), ALL_CFS).unwrap());
+        let path_str = path.path().to_str().unwrap();
+        let db_opts = DBOptions::new();
+        let mut cf_opts = ColumnFamilyOptions::new();
+        let f = Box::new(SizePropertiesCollectorFactory::default());
+        cf_opts.add_table_properties_collector_factory("tikv.size-collector", f);
+        let cfs_opts = ALL_CFS
+            .iter()
+            .map(|cf| CFOptions::new(cf, cf_opts.clone()))
+            .collect();
+        let engine = Arc::new(new_engine_opt(path_str, db_opts, cfs_opts).unwrap());
 
         let mut region = Region::new();
         region.set_id(1);
@@ -268,7 +332,9 @@ mod tests {
         runnable.run(Task::new(&region));
         // size has not reached the max_size 100 yet.
         match rx.try_recv() {
-            Err(TryRecvError::Empty) => {}
+            Ok(Msg::ApproximateRegionSize { region_id, .. }) => {
+                assert_eq!(region_id, region.get_id());
+            }
             others => panic!("expect recv empty, but got {:?}", others),
         }
 
@@ -277,12 +343,27 @@ mod tests {
             engine.put(&s, &s).unwrap();
         }
 
+        // Approximate size of memtable is inaccurate for small data,
+        // we flush it to SST so we can use the size properties instead.
+        engine.flush(true).unwrap();
+
         runnable.run(Task::new(&region));
         match rx.try_recv() {
-            Ok(Msg::SplitCheckResult { region_id, epoch, split_key }) => {
+            Ok(Msg::ApproximateRegionSize { region_id, .. }) => {
                 assert_eq!(region_id, region.get_id());
-                assert_eq!(&epoch, region.get_region_epoch());
-                assert_eq!(split_key, keys::data_key(b"0006"));
+            }
+            others => panic!("expect approximate region size, but got {:?}", others),
+        }
+        match rx.try_recv() {
+            Ok(Msg::SplitRegion {
+                region_id,
+                region_epoch,
+                split_key,
+                ..
+            }) => {
+                assert_eq!(region_id, region.get_id());
+                assert_eq!(&region_epoch, region.get_region_epoch());
+                assert_eq!(split_key, b"0006");
             }
             others => panic!("expect split check result, but got {:?}", others),
         }
@@ -295,13 +376,28 @@ mod tests {
                 engine.put_cf(handle, &s, &s).unwrap();
             }
         }
+        for cf in ALL_CFS {
+            let handle = engine.cf_handle(cf).unwrap();
+            engine.flush_cf(handle, true).unwrap();
+        }
 
         runnable.run(Task::new(&region));
         match rx.try_recv() {
-            Ok(Msg::SplitCheckResult { region_id, epoch, split_key }) => {
+            Ok(Msg::ApproximateRegionSize { region_id, .. }) => {
                 assert_eq!(region_id, region.get_id());
-                assert_eq!(&epoch, region.get_region_epoch());
-                assert_eq!(split_key, keys::data_key(b"0003"));
+            }
+            others => panic!("expect approximate region size, but got {:?}", others),
+        }
+        match rx.try_recv() {
+            Ok(Msg::SplitRegion {
+                region_id,
+                region_epoch,
+                split_key,
+                ..
+            }) => {
+                assert_eq!(region_id, region.get_id());
+                assert_eq!(&region_epoch, region.get_region_epoch());
+                assert_eq!(split_key, b"0003");
             }
             others => panic!("expect split check result, but got {:?}", others),
         }

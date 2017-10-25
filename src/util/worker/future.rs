@@ -12,7 +12,7 @@
 // limitations under the License.
 
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle, Builder};
+use std::thread::{self, Builder, JoinHandle};
 use std::io;
 use std::fmt::Display;
 
@@ -21,6 +21,7 @@ use futures::sync::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use tokio_core::reactor::{Core, Handle};
 
 use super::Stopped;
+use super::metrics::*;
 
 pub trait Runnable<T: Display> {
     fn run(&mut self, t: T, handle: &Handle);
@@ -46,9 +47,12 @@ impl<T: Display> Scheduler<T> {
     /// If the worker is stopped, an error will return.
     pub fn schedule(&self, task: T) -> Result<(), Stopped<T>> {
         debug!("scheduling task {}", task);
-        if let Err(err) = self.sender.send(Some(task)) {
+        if let Err(err) = self.sender.unbounded_send(Some(task)) {
             return Err(Stopped(err.into_inner().unwrap()));
         }
+        WORKER_PENDING_TASK_VEC
+            .with_label_values(&[&self.name])
+            .inc();
         Ok(())
     }
 }
@@ -71,14 +75,18 @@ pub struct Worker<T: Display> {
 
 // TODO: add metrics.
 fn poll<R, T>(mut runner: R, rx: UnboundedReceiver<Option<T>>)
-    where R: Runnable<T> + Send + 'static,
-          T: Display + Send + 'static
+where
+    R: Runnable<T> + Send + 'static,
+    T: Display + Send + 'static,
 {
+    let name = thread::current().name().unwrap().to_owned();
     let mut core = Core::new().unwrap();
     let handle = core.handle();
     {
         let f = rx.take_while(|t| Ok(t.is_some())).for_each(|t| {
             runner.run(t.unwrap(), &handle);
+            WORKER_PENDING_TASK_VEC.with_label_values(&[&name]).sub(1.0);
+            WORKER_HANDLED_TASK_VEC.with_label_values(&[&name]).inc();
             Ok(())
         });
         // `UnboundedReceiver` never returns an error.
@@ -100,7 +108,8 @@ impl<T: Display + Send + 'static> Worker<T> {
 
     /// Start the worker.
     pub fn start<R>(&mut self, runner: R) -> Result<(), io::Error>
-        where R: Runnable<T> + Send + 'static
+    where
+        R: Runnable<T> + Send + 'static,
     {
         let mut receiver = self.receiver.lock().unwrap();
         info!("starting working thread: {}", self.scheduler.name);
@@ -110,9 +119,9 @@ impl<T: Display + Send + 'static> Worker<T> {
         }
 
         let rx = receiver.take().unwrap();
-        let h = try!(Builder::new()
+        let h = Builder::new()
             .name(thd_name!(self.scheduler.name.as_ref()))
-            .spawn(move || poll(runner, rx)));
+            .spawn(move || poll(runner, rx))?;
 
         self.handle = Some(h);
         Ok(())
@@ -146,7 +155,7 @@ impl<T: Display + Send + 'static> Worker<T> {
         if self.handle.is_none() {
             return None;
         }
-        if let Err(e) = self.scheduler.sender.send(None) {
+        if let Err(e) = self.scheduler.sender.unbounded_send(None) {
             warn!("failed to stop worker thread: {:?}", e);
         }
         self.handle.take()
@@ -174,7 +183,9 @@ mod test {
     impl Runnable<u64> for StepRunner {
         fn run(&mut self, step: u64, handle: &Handle) {
             self.ch.send(step).unwrap();
-            let f = self.timer.sleep(Duration::from_millis(step)).map_err(|_| ());
+            let f = self.timer
+                .sleep(Duration::from_millis(step))
+                .map_err(|_| ());
             handle.spawn(f);
         }
 
@@ -187,7 +198,8 @@ mod test {
     fn test_future_worker() {
         let mut worker = Worker::new("test-async-worker");
         let (tx, rx) = mpsc::channel();
-        worker.start(StepRunner {
+        worker
+            .start(StepRunner {
                 timer: Timer::default(),
                 ch: tx,
             })

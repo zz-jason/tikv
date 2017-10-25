@@ -13,28 +13,32 @@
 
 use kvproto::raft_serverpb::RaftMessage;
 use kvproto::eraftpb::MessageType;
-use tikv::raftstore::{Result, Error};
-use tikv::raftstore::store::{Msg as StoreMsg, Transport};
+use tikv::raftstore::{Error, Result};
+use tikv::raftstore::store::{Msg as StoreMsg, SignificantMsg, Transport};
 use tikv::server::transport::*;
 use tikv::server::StoreAddrResolver;
-use tikv::util::{HandyRwLock, transport, Either};
+use tikv::util::{transport, Either, HandyRwLock};
 
 use rand;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::sync::mpsc::Sender;
 use std::marker::PhantomData;
-use std::{time, usize, thread};
+use std::{thread, time, usize};
 use std::sync::atomic::*;
 
 pub trait Channel<M>: Send + Clone {
     fn send(&self, m: M) -> Result<()>;
+    fn significant_send(&self, _: SignificantMsg) -> Result<()> {
+        unimplemented!()
+    }
     fn flush(&mut self) {}
 }
 
 impl<T, S> Channel<RaftMessage> for ServerTransport<T, S>
-    where T: RaftStoreRouter,
-          S: StoreAddrResolver
+where
+    T: RaftStoreRouter,
+    S: StoreAddrResolver,
 {
     fn send(&self, m: RaftMessage) -> Result<()> {
         Transport::send(self, m)
@@ -49,12 +53,18 @@ impl Channel<StoreMsg> for ServerRaftStoreRouter {
     fn send(&self, m: StoreMsg) -> Result<()> {
         RaftStoreRouter::try_send(self, m)
     }
+
+    fn significant_send(&self, msg: SignificantMsg) -> Result<()> {
+        RaftStoreRouter::significant_send(self, msg)
+    }
 }
 
 pub fn check_messages<M>(msgs: &[M]) -> Result<()> {
     if msgs.is_empty() {
-        Err(Error::Transport(transport::Error::Discard(String::from("messages dropped by \
-                                                                 SimulateTransport Filter"))))
+        Err(Error::Transport(transport::Error::Discard(String::from(
+            "messages dropped by \
+             SimulateTransport Filter",
+        ))))
     } else {
         Ok(())
     }
@@ -111,14 +121,14 @@ impl<M> Filter<M> for DelayFilter {
 
 pub struct SimulateTransport<M, C: Channel<M>> {
     filters: Arc<RwLock<Vec<Box<Filter<M>>>>>,
-    ch: C,
+    ch: Arc<Mutex<C>>,
 }
 
 impl<M, C: Channel<M>> SimulateTransport<M, C> {
     pub fn new(ch: C) -> SimulateTransport<M, C> {
         SimulateTransport {
             filters: Arc::new(RwLock::new(vec![])),
-            ch: ch,
+            ch: Arc::new(Mutex::new(ch)),
         }
     }
 
@@ -146,7 +156,7 @@ impl<M, C: Channel<M>> Channel<M> for SimulateTransport<M, C> {
         }
         if res.is_ok() {
             for msg in msgs {
-                res = self.ch.send(msg);
+                res = self.ch.lock().unwrap().send(msg);
                 if res.is_err() {
                     break;
                 }
@@ -174,7 +184,7 @@ impl<C: Channel<RaftMessage>> Transport for SimulateTransport<RaftMessage, C> {
     }
 
     fn flush(&mut self) {
-        self.ch.flush();
+        self.ch.lock().unwrap().flush();
     }
 }
 
@@ -185,6 +195,10 @@ impl<C: Channel<StoreMsg>> RaftStoreRouter for SimulateTransport<StoreMsg, C> {
 
     fn try_send(&self, m: StoreMsg) -> Result<()> {
         Channel::send(self, m)
+    }
+
+    fn significant_send(&self, m: SignificantMsg) -> Result<()> {
+        self.ch.lock().unwrap().significant_send(m)
     }
 }
 
@@ -234,9 +248,17 @@ impl PartitionFilterFactory {
 impl FilterFactory for PartitionFilterFactory {
     fn generate(&self, node_id: u64) -> Vec<SendFilter> {
         if self.s1.contains(&node_id) {
-            return vec![box PartitionFilter { node_ids: self.s2.clone() }];
+            return vec![
+                box PartitionFilter {
+                    node_ids: self.s2.clone(),
+                },
+            ];
         }
-        return vec![box PartitionFilter { node_ids: self.s1.clone() }];
+        return vec![
+            box PartitionFilter {
+                node_ids: self.s1.clone(),
+            },
+        ];
     }
 }
 
@@ -255,7 +277,11 @@ impl FilterFactory for IsolationFilterFactory {
         if node_id == self.node_id {
             return vec![box DropPacketFilter { rate: 100 }];
         }
-        vec![box PartitionFilter { node_ids: vec![self.node_id] }]
+        vec![
+            box PartitionFilter {
+                node_ids: vec![self.node_id],
+            },
+        ]
     }
 }
 
@@ -302,21 +328,22 @@ impl Filter<RaftMessage> for RegionPacketFilter {
             let to_store_id = m.get_to_peer().get_store_id();
 
             if self.region_id == region_id &&
-               (self.direction.is_send() && self.store_id == from_store_id ||
-                self.direction.is_recv() && self.store_id == to_store_id) &&
-               self.msg_type.as_ref().map_or(true, |t| t == &m.get_message().get_msg_type()) {
+                (self.direction.is_send() && self.store_id == from_store_id ||
+                    self.direction.is_recv() && self.store_id == to_store_id) &&
+                self.msg_type
+                    .as_ref()
+                    .map_or(true, |t| t == &m.get_message().get_msg_type())
+            {
                 return match self.block {
-                    Either::Left(ref count) => {
-                        loop {
-                            let left = count.load(Ordering::SeqCst);
-                            if left == 0 {
-                                return false;
-                            }
-                            if count.compare_and_swap(left, left - 1, Ordering::SeqCst) == left {
-                                return true;
-                            }
+                    Either::Left(ref count) => loop {
+                        let left = count.load(Ordering::SeqCst);
+                        if left == 0 {
+                            return false;
                         }
-                    }
+                        if count.compare_and_swap(left, left - 1, Ordering::SeqCst) == left {
+                            return true;
+                        }
+                    },
                     Either::Right(ref block) => !block.load(Ordering::SeqCst),
                 };
             }
@@ -365,7 +392,9 @@ pub struct SnapshotFilter {
 
 impl Filter<RaftMessage> for SnapshotFilter {
     fn before(&self, msgs: &mut Vec<RaftMessage>) -> Result<()> {
-        msgs.retain(|m| m.get_message().get_msg_type() != MessageType::MsgSnapshot);
+        msgs.retain(|m| {
+            m.get_message().get_msg_type() != MessageType::MsgSnapshot
+        });
         self.drop.store(msgs.is_empty(), Ordering::Relaxed);
         check_messages(msgs)
     }
@@ -427,11 +456,10 @@ impl Filter<StoreMsg> for CollectSnapshotFilter {
                 _ => (false, 0),
             };
             if is_pending {
-                self.dropped.compare_and_swap(false, true, Ordering::Relaxed);
+                self.dropped
+                    .compare_and_swap(false, true, Ordering::Relaxed);
                 pending_msg.insert(from_peer_id, m);
-                let sender = self.pending_count_sender
-                    .lock()
-                    .unwrap();
+                let sender = self.pending_count_sender.lock().unwrap();
                 sender.send(pending_msg.len()).unwrap();
             } else {
                 to_send.push(m);
@@ -439,7 +467,8 @@ impl Filter<StoreMsg> for CollectSnapshotFilter {
         }
         // Deliver those pending snapshots if there are more than 1.
         if pending_msg.len() > 1 {
-            self.dropped.compare_and_swap(true, false, Ordering::Relaxed);
+            self.dropped
+                .compare_and_swap(true, false, Ordering::Relaxed);
             msgs.extend(pending_msg.drain().map(|(_, v)| v));
             self.stale.compare_and_swap(false, true, Ordering::Relaxed);
         }
@@ -449,7 +478,8 @@ impl Filter<StoreMsg> for CollectSnapshotFilter {
 
     fn after(&self, res: Result<()>) -> Result<()> {
         if res.is_err() && self.dropped.load(Ordering::Relaxed) {
-            self.dropped.compare_and_swap(true, false, Ordering::Relaxed);
+            self.dropped
+                .compare_and_swap(true, false, Ordering::Relaxed);
             Ok(())
         } else {
             res
@@ -463,28 +493,28 @@ pub struct DropSnapshotFilter {
 
 impl DropSnapshotFilter {
     pub fn new(ch: Sender<u64>) -> DropSnapshotFilter {
-        DropSnapshotFilter { notifier: Mutex::new(ch) }
+        DropSnapshotFilter {
+            notifier: Mutex::new(ch),
+        }
     }
 }
 
 impl Filter<StoreMsg> for DropSnapshotFilter {
     fn before(&self, msgs: &mut Vec<StoreMsg>) -> Result<()> {
         let notifier = self.notifier.lock().unwrap();
-        msgs.retain(|m| {
-            match *m {
-                StoreMsg::RaftMessage(ref msg) => {
-                    if msg.get_message().get_msg_type() != MessageType::MsgSnapshot {
-                        true
-                    } else {
-                        let idx = msg.get_message().get_snapshot().get_metadata().get_index();
-                        if let Err(e) = notifier.send(idx) {
-                            error!("failed to notify snapshot {:?}: {:?}", msg, e);
-                        }
-                        false
+        msgs.retain(|m| match *m {
+            StoreMsg::RaftMessage(ref msg) => {
+                if msg.get_message().get_msg_type() != MessageType::MsgSnapshot {
+                    true
+                } else {
+                    let idx = msg.get_message().get_snapshot().get_metadata().get_index();
+                    if let Err(e) = notifier.send(idx) {
+                        error!("failed to notify snapshot {:?}: {:?}", msg, e);
                     }
+                    false
                 }
-                _ => true,
             }
+            _ => true,
         });
         Ok(())
     }
@@ -548,8 +578,13 @@ impl Filter<StoreMsg> for LeadingDuplicatedSnapshotFilter {
     }
 
     fn after(&self, res: Result<()>) -> Result<()> {
-        let dropped = self.dropped.compare_and_swap(true, false, Ordering::Relaxed);
-        if res.is_err() && dropped { Ok(()) } else { res }
+        let dropped = self.dropped
+            .compare_and_swap(true, false, Ordering::Relaxed);
+        if res.is_err() && dropped {
+            Ok(())
+        } else {
+            res
+        }
     }
 }
 

@@ -26,14 +26,16 @@
 // limitations under the License.
 
 
-use raft::errors::{Result, Error};
+use std::mem;
+
+use raft::errors::{Error, Result};
 use raft::Storage;
 use protobuf::{self, RepeatedField};
-use kvproto::eraftpb::{HardState, Entry, EntryType, Message, Snapshot, MessageType, ConfChange,
-                       ConfChangeType, ConfState};
-use raft::raft::{Config, Raft, SoftState, INVALID_ID};
-use raft::Status;
-use raft::read_only::ReadState;
+use kvproto::eraftpb::{ConfChange, ConfChangeType, ConfState, Entry, EntryType, HardState,
+                       Message, MessageType, Snapshot};
+use super::raft::{Config, Raft, SoftState, INVALID_ID};
+use super::Status;
+use super::read_only::ReadState;
 
 #[derive(Debug, Default)]
 pub struct Peer {
@@ -111,30 +113,41 @@ pub struct Ready {
     // If it contains a MsgSnap message, the application MUST report back to raft
     // when the snapshot has been received or has failed by calling ReportSnapshot.
     pub messages: Vec<Message>,
+
+    // MustSync indicates whether the HardState and Entries must be synchronously
+    // written to disk or if an asynchronous write is permissible.
+    pub must_sync: bool,
 }
 
 impl Ready {
-    fn new<T: Storage>(raft: &mut Raft<T>,
-                       prev_ss: &SoftState,
-                       prev_hs: &HardState,
-                       since_idx: Option<u64>)
-                       -> Ready {
+    fn new<T: Storage>(
+        raft: &mut Raft<T>,
+        prev_ss: &SoftState,
+        prev_hs: &HardState,
+        since_idx: Option<u64>,
+    ) -> Ready {
         let mut rd = Ready {
             entries: raft.raft_log.unstable_entries().unwrap_or(&[]).to_vec(),
-            messages: raft.msgs.drain(..).collect(),
             ..Default::default()
         };
-        rd.committed_entries = Some((match since_idx {
+        if !raft.msgs.is_empty() {
+            mem::swap(&mut raft.msgs, &mut rd.messages);
+        }
+        rd.committed_entries = Some(
+            (match since_idx {
                 None => raft.raft_log.next_entries(),
                 Some(idx) => raft.raft_log.next_entries_since(idx),
-            })
-            .unwrap_or_else(Vec::new));
+            }).unwrap_or_else(Vec::new),
+        );
         let ss = raft.soft_state();
         if &ss != prev_ss {
             rd.ss = Some(ss);
         }
         let hs = raft.hard_state();
         if &hs != prev_hs {
+            if hs.get_vote() != prev_hs.get_vote() || hs.get_term() != prev_hs.get_term() {
+                rd.must_sync = true;
+            }
             rd.hs = Some(hs);
         }
         if raft.raft_log.get_unstable().snapshot.is_some() {
@@ -177,8 +190,8 @@ impl<T: Storage> RawNode<T> {
                 if peer.context.is_some() {
                     cc.set_context(peer.context.as_ref().unwrap().clone());
                 }
-                let data = protobuf::Message::write_to_bytes(&cc)
-                    .expect("unexpected marshal error");
+                let data =
+                    protobuf::Message::write_to_bytes(&cc).expect("unexpected marshal error");
                 let mut e = Entry::new();
                 e.set_entry_type(EntryType::EntryConfChange);
                 e.set_term(1);
@@ -215,7 +228,9 @@ impl<T: Storage> RawNode<T> {
             self.raft.raft_log.stable_to(e.get_index(), e.get_term());
         }
         if rd.snapshot != Snapshot::new() {
-            self.raft.raft_log.stable_snap_to(rd.snapshot.get_metadata().get_index());
+            self.raft
+                .raft_log
+                .stable_snap_to(rd.snapshot.get_metadata().get_index());
         }
         if !rd.read_states.is_empty() {
             self.raft.read_states.clear();
@@ -241,12 +256,15 @@ impl<T: Storage> RawNode<T> {
     }
 
     // Propose proposes data be appended to the raft log.
-    pub fn propose(&mut self, data: Vec<u8>) -> Result<()> {
+    pub fn propose(&mut self, data: Vec<u8>, sync_log: bool) -> Result<()> {
         let mut m = Message::new();
         m.set_msg_type(MessageType::MsgPropose);
         m.set_from(self.raft.id);
         let mut e = Entry::new();
         e.set_data(data);
+        if sync_log {
+            e.set_sync_log(true);
+        }
         m.set_entries(RepeatedField::from_vec(vec![e]));
         self.raft.step(m)
     }
@@ -259,6 +277,7 @@ impl<T: Storage> RawNode<T> {
         let mut e = Entry::new();
         e.set_entry_type(EntryType::EntryConfChange);
         e.set_data(data);
+        e.set_sync_log(true);
         m.set_entries(RepeatedField::from_vec(vec![e]));
         self.raft.step(m)
     }
@@ -294,10 +313,12 @@ impl<T: Storage> RawNode<T> {
     }
 
     pub fn ready_since(&mut self, applied_idx: u64) -> Ready {
-        Ready::new(&mut self.raft,
-                   &self.prev_ss,
-                   &self.prev_hs,
-                   Some(applied_idx))
+        Ready::new(
+            &mut self.raft,
+            &self.prev_ss,
+            &self.prev_hs,
+            Some(applied_idx),
+        )
     }
 
     // Ready returns the current point-in-time state of this RawNode.
@@ -436,25 +457,27 @@ mod test {
 
     #[test]
     fn test_is_local_msg() {
-        let tests = vec![(MessageType::MsgHup, true),
-                         (MessageType::MsgBeat, true),
-                         (MessageType::MsgUnreachable, true),
-                         (MessageType::MsgSnapStatus, true),
-                         (MessageType::MsgCheckQuorum, true),
-                         (MessageType::MsgPropose, false),
-                         (MessageType::MsgAppend, false),
-                         (MessageType::MsgAppendResponse, false),
-                         (MessageType::MsgRequestVote, false),
-                         (MessageType::MsgRequestVoteResponse, false),
-                         (MessageType::MsgSnapshot, false),
-                         (MessageType::MsgHeartbeat, false),
-                         (MessageType::MsgHeartbeatResponse, false),
-                         (MessageType::MsgTransferLeader, false),
-                         (MessageType::MsgTimeoutNow, false),
-                         (MessageType::MsgReadIndex, false),
-                         (MessageType::MsgReadIndexResp, false),
-                         (MessageType::MsgRequestPreVote, false),
-                         (MessageType::MsgRequestPreVoteResponse, false)];
+        let tests = vec![
+            (MessageType::MsgHup, true),
+            (MessageType::MsgBeat, true),
+            (MessageType::MsgUnreachable, true),
+            (MessageType::MsgSnapStatus, true),
+            (MessageType::MsgCheckQuorum, true),
+            (MessageType::MsgPropose, false),
+            (MessageType::MsgAppend, false),
+            (MessageType::MsgAppendResponse, false),
+            (MessageType::MsgRequestVote, false),
+            (MessageType::MsgRequestVoteResponse, false),
+            (MessageType::MsgSnapshot, false),
+            (MessageType::MsgHeartbeat, false),
+            (MessageType::MsgHeartbeatResponse, false),
+            (MessageType::MsgTransferLeader, false),
+            (MessageType::MsgTimeoutNow, false),
+            (MessageType::MsgReadIndex, false),
+            (MessageType::MsgReadIndexResp, false),
+            (MessageType::MsgRequestPreVote, false),
+            (MessageType::MsgRequestPreVoteResponse, false),
+        ];
         for (msg_type, result) in tests {
             assert_eq!(is_local_msg(msg_type), result);
         }

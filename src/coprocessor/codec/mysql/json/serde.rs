@@ -11,8 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use serde::ser::{Serialize, Serializer, SerializeTuple, SerializeMap};
-use serde::de::{self, Deserialize, Deserializer, Visitor, SeqAccess, MapAccess};
+use serde::ser::{Serialize, SerializeMap, SerializeTuple, Serializer};
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -40,28 +40,30 @@ impl FromStr for Json {
 
 impl Serialize for Json {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where S: Serializer
+    where
+        S: Serializer,
     {
         match *self {
             Json::None => serializer.serialize_none(),
             Json::Boolean(d) => serializer.serialize_bool(d),
             Json::String(ref s) => serializer.serialize_str(s),
             Json::Object(ref obj) => {
-                let mut map = try!(serializer.serialize_map(Some(obj.len())));
+                let mut map = serializer.serialize_map(Some(obj.len()))?;
                 for (k, v) in obj {
-                    try!(map.serialize_entry(k, v));
+                    map.serialize_entry(k, v)?;
                 }
                 map.end()
             }
             Json::Array(ref array) => {
-                let mut tup = try!(serializer.serialize_tuple(array.len()));
+                let mut tup = serializer.serialize_tuple(array.len())?;
                 for item in array {
-                    try!(tup.serialize_element(item));
+                    tup.serialize_element(item)?;
                 }
                 tup.end()
             }
             Json::Double(d) => serializer.serialize_f64(d),
             Json::I64(d) => serializer.serialize_i64(d),
+            Json::U64(d) => serializer.serialize_u64(d),
         }
     }
 }
@@ -74,43 +76,50 @@ impl<'de> Visitor<'de> for JsonVisitor {
     }
 
     fn visit_unit<E>(self) -> Result<Self::Value, E>
-        where E: de::Error
+    where
+        E: de::Error,
     {
         Ok(Json::None)
     }
 
     fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
-        where E: de::Error
+    where
+        E: de::Error,
     {
         Ok(Json::Boolean(v))
     }
 
     fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
-        where E: de::Error
+    where
+        E: de::Error,
     {
         Ok(Json::I64(v))
     }
 
     fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
-        where E: de::Error
+    where
+        E: de::Error,
     {
-        self.visit_i64(v as i64)
+        Ok(Json::U64(v))
     }
 
     fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
-        where E: de::Error
+    where
+        E: de::Error,
     {
         Ok(Json::Double(v))
     }
 
     fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-        where E: de::Error
+    where
+        E: de::Error,
     {
         Ok(Json::String(String::from(v)))
     }
 
     fn visit_seq<M>(self, mut seq: M) -> Result<Self::Value, M::Error>
-        where M: SeqAccess<'de>
+    where
+        M: SeqAccess<'de>,
     {
         let mut seqs = Vec::with_capacity(seq.size_hint().unwrap_or(0));
         while let Some(value) = seq.next_element()? {
@@ -120,7 +129,8 @@ impl<'de> Visitor<'de> for JsonVisitor {
     }
 
     fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
-        where M: MapAccess<'de>
+    where
+        M: MapAccess<'de>,
     {
         let mut map = BTreeMap::new();
         while let Some((key, value)) = access.next_entry()? {
@@ -132,7 +142,8 @@ impl<'de> Visitor<'de> for JsonVisitor {
 
 impl<'de> Deserialize<'de> for Json {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where D: Deserializer<'de>
+    where
+        D: Deserializer<'de>,
     {
         deserializer.deserialize_any(JsonVisitor)
     }
@@ -153,15 +164,16 @@ mod test {
 
     #[test]
     fn test_from_str() {
-        let legal_cases = vec!{
+        let legal_cases = vec![
             (r#"{"key":"value"}"#),
             (r#"["d1","d2"]"#),
+            (r#"-3"#),
             (r#"3"#),
             (r#"3.0"#),
             (r#"null"#),
             (r#"true"#),
             (r#"false"#),
-        };
+        ];
 
         for json_str in legal_cases {
             let resp = Json::from_str(json_str);

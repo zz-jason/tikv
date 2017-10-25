@@ -12,22 +12,22 @@
 // limitations under the License.
 
 
-use std::collections::{HashMap, BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::collections::Bound::{Excluded, Unbounded};
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::{Future, Stream};
-use futures::future::{ok, err};
-use futures::sync::mpsc::{self, UnboundedSender, UnboundedReceiver};
+use futures::future::{err, ok};
+use futures::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use kvproto::metapb;
 use kvproto::pdpb;
 use kvproto::eraftpb;
-use tikv::pd::{PdClient, Result, Error, Key, PdFuture, RegionStat};
-use tikv::raftstore::store::keys::{self, enc_end_key, enc_start_key, data_key};
+use tikv::pd::{Error, Key, PdClient, PdFuture, RegionStat, Result};
+use tikv::raftstore::store::keys::{self, data_key, enc_end_key, enc_start_key};
 use tikv::raftstore::store::util::check_key_in_region;
-use tikv::util::{HandyRwLock, escape};
+use tikv::util::{escape, HandyRwLock};
 use super::util::*;
 
 // Rule is just for special test which we want do more accurate control
@@ -35,8 +35,12 @@ use super::util::*;
 // E.g, for region a, change peers 1,2,3 -> 1,2,4.
 // But unlike real pd, Rule is global, and if you set rule,
 // we won't check the peer count later.
-pub type Rule =
-    Box<Fn(&metapb::Region, &metapb::Peer) -> Option<pdpb::RegionHeartbeatResponse> + Send + Sync>;
+pub type Rule = Box<
+    Fn(&metapb::Region, &metapb::Peer)
+        -> Option<pdpb::RegionHeartbeatResponse>
+        + Send
+        + Sync,
+>;
 
 struct Store {
     store: metapb::Store,
@@ -144,7 +148,11 @@ impl Cluster {
     }
 
     fn get_region_by_id(&self, region_id: u64) -> Result<Option<metapb::Region>> {
-        Ok(self.region_id_keys.get(&region_id).and_then(|k| self.regions.get(k).cloned()))
+        Ok(
+            self.region_id_keys
+                .get(&region_id)
+                .and_then(|k| self.regions.get(k).cloned()),
+        )
     }
 
     fn get_stores(&self) -> Vec<metapb::Store> {
@@ -157,8 +165,16 @@ impl Cluster {
 
     fn add_region(&mut self, region: &metapb::Region) {
         let end_key = enc_end_key(region);
-        assert!(self.regions.insert(end_key.clone(), region.clone()).is_none());
-        assert!(self.region_id_keys.insert(region.get_id(), end_key.clone()).is_none());
+        assert!(
+            self.regions
+                .insert(end_key.clone(), region.clone())
+                .is_none()
+        );
+        assert!(
+            self.region_id_keys
+                .insert(region.get_id(), end_key.clone())
+                .is_none()
+        );
     }
 
     fn remove_region(&mut self, region: &metapb::Region) {
@@ -217,10 +233,11 @@ impl Cluster {
         Ok(())
     }
 
-    fn handle_heartbeat_conf_ver(&mut self,
-                                 region: metapb::Region,
-                                 leader: metapb::Peer)
-                                 -> Result<pdpb::RegionHeartbeatResponse> {
+    fn handle_heartbeat_conf_ver(
+        &mut self,
+        region: metapb::Region,
+        leader: metapb::Peer,
+    ) -> Result<pdpb::RegionHeartbeatResponse> {
         let conf_ver = region.get_region_epoch().get_conf_ver();
         let end_key = enc_end_key(&region);
 
@@ -228,7 +245,7 @@ impl Cluster {
         let cur_region = self.get_region_by_id(region.get_id()).unwrap().unwrap();
 
         let cur_conf_ver = cur_region.get_region_epoch().get_conf_ver();
-        try!(check_stale_region(&cur_region, &region));
+        check_stale_region(&cur_region, &region)?;
 
         let region_peer_len = region.get_peers().len();
         let cur_region_peer_len = cur_region.get_peers().len();
@@ -271,14 +288,16 @@ impl Cluster {
         resp.set_target_peer(leader.clone());
 
         if let Some(ref rule) = self.rule {
-            return Ok(rule(&region, &leader)
-                .map(|mut resp| {
-                    resp.set_region_id(region.get_id());
-                    resp.set_region_epoch(region.get_region_epoch().clone());
-                    resp.set_target_peer(leader.clone());
-                    resp
-                })
-                .unwrap_or(resp));
+            return Ok(
+                rule(&region, &leader)
+                    .map(|mut resp| {
+                        resp.set_region_id(region.get_id());
+                        resp.set_region_epoch(region.get_region_epoch().clone());
+                        resp.set_target_peer(leader.clone());
+                        resp
+                    })
+                    .unwrap_or(resp),
+            );
         }
 
         // If no rule, use default max_peer_count check.
@@ -290,7 +309,11 @@ impl Cluster {
         if peer_count < max_peer_count {
             // find the first store which the region has not covered.
             for store_id in self.stores.keys() {
-                if region.get_peers().iter().all(|x| x.get_store_id() != *store_id) {
+                if region
+                    .get_peers()
+                    .iter()
+                    .all(|x| x.get_store_id() != *store_id)
+                {
                     let peer = new_peer(*store_id, self.alloc_id().unwrap());
                     change_peer.set_change_type(eraftpb::ConfChangeType::AddNode.into());
                     change_peer.set_peer(peer.clone());
@@ -300,7 +323,8 @@ impl Cluster {
             }
         } else if peer_count > max_peer_count {
             // find the first peer which not leader.
-            let pos = region.get_peers()
+            let pos = region
+                .get_peers()
                 .iter()
                 .position(|x| x.get_store_id() != leader.get_store_id())
                 .unwrap();
@@ -314,11 +338,12 @@ impl Cluster {
         Ok(resp)
     }
 
-    fn region_heartbeat(&mut self,
-                        region: metapb::Region,
-                        leader: metapb::Peer,
-                        region_stat: RegionStat)
-                        -> Result<pdpb::RegionHeartbeatResponse> {
+    fn region_heartbeat(
+        &mut self,
+        region: metapb::Region,
+        leader: metapb::Peer,
+        region_stat: RegionStat,
+    ) -> Result<pdpb::RegionHeartbeatResponse> {
         for peer in region.get_peers() {
             self.down_peers.remove(&peer.get_id());
             self.pending_peers.remove(&peer.get_id());
@@ -330,7 +355,7 @@ impl Cluster {
             self.pending_peers.insert(p.get_id(), p);
         }
 
-        try!(self.handle_heartbeat_version(region.clone()));
+        self.handle_heartbeat_version(region.clone())?;
         self.handle_heartbeat_conf_ver(region, leader)
     }
 }
@@ -339,11 +364,16 @@ fn check_stale_region(region: &metapb::Region, check_region: &metapb::Region) ->
     let epoch = region.get_region_epoch();
     let check_epoch = check_region.get_region_epoch();
     if check_epoch.get_conf_ver() >= epoch.get_conf_ver() &&
-       check_epoch.get_version() >= epoch.get_version() {
+        check_epoch.get_version() >= epoch.get_version()
+    {
         return Ok(());
     }
 
-    Err(box_err!("stale epoch {:?}, we are now {:?}", check_epoch, epoch))
+    Err(box_err!(
+        "stale epoch {:?}, we are now {:?}",
+        check_epoch,
+        epoch
+    ))
 }
 
 fn must_same_peers(left: &metapb::Region, right: &metapb::Region) {
@@ -424,7 +454,11 @@ impl TestPdClient {
     }
 
     pub fn get_region_epoch(&self, region_id: u64) -> metapb::RegionEpoch {
-        self.get_region_by_id(region_id).wait().unwrap().unwrap().take_region_epoch()
+        self.get_region_by_id(region_id)
+            .wait()
+            .unwrap()
+            .unwrap()
+            .take_region_epoch()
     }
     pub fn get_regions_number(&self) -> usize {
         self.cluster.rl().get_regions_number()
@@ -451,9 +485,7 @@ impl TestPdClient {
             }
         }
 
-        let region = self.get_region_by_id(region_id)
-            .wait()
-            .unwrap();
+        let region = self.get_region_by_id(region_id).wait().unwrap();
         panic!("region {:?} has no peer {:?}", region, peer);
     }
 
@@ -471,9 +503,7 @@ impl TestPdClient {
             }
         }
 
-        let region = self.get_region_by_id(region_id)
-            .wait()
-            .unwrap();
+        let region = self.get_region_by_id(region_id).wait().unwrap();
         panic!("region {:?} has peer {:?}", region, peer);
     }
     pub fn add_region(&self, region: &metapb::Region) {
@@ -482,10 +512,12 @@ impl TestPdClient {
 
     pub fn add_peer(&self, region_id: u64, peer: metapb::Peer) {
         self.set_rule(box move |region: &metapb::Region, _: &metapb::Peer| {
-            debug!("[region {}] trying add {:?} to {:?}",
-                   region_id,
-                   peer,
-                   region);
+            debug!(
+                "[region {}] trying add {:?} to {:?}",
+                region_id,
+                peer,
+                region
+            );
             if region.get_id() != region_id {
                 return None;
             }
@@ -586,18 +618,18 @@ impl PdClient for TestPdClient {
     }
 
     fn put_store(&self, store: metapb::Store) -> Result<()> {
-        try!(self.check_bootstrap());
+        self.check_bootstrap()?;
         self.cluster.wl().put_store(store)
     }
 
     fn get_store(&self, store_id: u64) -> Result<metapb::Store> {
-        try!(self.check_bootstrap());
+        self.check_bootstrap()?;
         self.cluster.rl().get_store(store_id)
     }
 
 
     fn get_region(&self, key: &[u8]) -> Result<metapb::Region> {
-        try!(self.check_bootstrap());
+        self.check_bootstrap()?;
         if let Some(region) = self.cluster.rl().get_region(data_key(key)) {
             if check_key_in_region(key, &region).is_ok() {
                 return Ok(region);
@@ -609,64 +641,74 @@ impl PdClient for TestPdClient {
 
     fn get_region_by_id(&self, region_id: u64) -> PdFuture<Option<metapb::Region>> {
         if let Err(e) = self.check_bootstrap() {
-            return err(e).boxed();
+            return Box::new(err(e));
         }
         match self.cluster.rl().get_region_by_id(region_id) {
-            Ok(resp) => ok(resp).boxed(),
-            Err(e) => err(e).boxed(),
+            Ok(resp) => Box::new(ok(resp)),
+            Err(e) => Box::new(err(e)),
         }
     }
 
     fn get_cluster_config(&self) -> Result<metapb::Cluster> {
-        try!(self.check_bootstrap());
+        self.check_bootstrap()?;
         Ok(self.cluster.rl().meta.clone())
     }
 
 
-    fn region_heartbeat(&self,
-                        region: metapb::Region,
-                        leader: metapb::Peer,
-                        region_stat: RegionStat)
-                        -> PdFuture<()> {
+    fn region_heartbeat(
+        &self,
+        region: metapb::Region,
+        leader: metapb::Peer,
+        region_stat: RegionStat,
+    ) -> PdFuture<()> {
         if let Err(e) = self.check_bootstrap() {
-            return err(e).boxed();
+            return Box::new(err(e));
         }
-        let resp = self.cluster.wl().region_heartbeat(region, leader.clone(), region_stat);
+        let resp = self.cluster
+            .wl()
+            .region_heartbeat(region, leader.clone(), region_stat);
         match resp {
             Ok(resp) => {
                 let store_id = leader.get_store_id();
                 if let Some(store) = self.cluster.wl().stores.get(&store_id) {
-                    store.sender.send(resp).unwrap();
+                    store.sender.unbounded_send(resp).unwrap();
                 }
-                ok(()).boxed()
+                Box::new(ok(()))
             }
-            Err(e) => err(e).boxed(),
+            Err(e) => Box::new(err(e)),
         }
     }
 
     fn handle_region_heartbeat_response<F>(&self, store_id: u64, f: F) -> PdFuture<()>
-        where F: Fn(pdpb::RegionHeartbeatResponse) + Send + 'static
+    where
+        F: Fn(pdpb::RegionHeartbeatResponse) + Send + 'static,
     {
         let mut cluster = self.cluster.wl();
         let store = cluster.stores.get_mut(&store_id).unwrap();
         let rx = store.receiver.take().unwrap();
-        rx.for_each(move |resp| {
+        Box::new(
+            rx.for_each(move |resp| {
                 f(resp);
                 Ok(())
-            })
-            .map_err(|e| box_err!("failed to receive next heartbeat response: {:?}", e))
-            .boxed()
+            }).map_err(|e| {
+                    box_err!("failed to receive next heartbeat response: {:?}", e)
+                }),
+        )
     }
 
     fn ask_split(&self, region: metapb::Region) -> PdFuture<pdpb::AskSplitResponse> {
         if let Err(e) = self.check_bootstrap() {
-            return err(e).boxed();
+            return Box::new(err(e));
         }
 
         // Must ConfVer and Version be same?
-        let cur_region = self.cluster.rl().get_region_by_id(region.get_id()).unwrap().unwrap();
+        let cur_region = self.cluster
+            .rl()
+            .get_region_by_id(region.get_id())
+            .unwrap()
+            .unwrap();
         if let Err(e) = check_stale_region(&cur_region, &region) {
-            return err(e).boxed();
+            return Box::new(err(e));
         }
 
         let mut resp = pdpb::AskSplitResponse::new();
@@ -677,27 +719,27 @@ impl PdClient for TestPdClient {
         }
         resp.set_new_peer_ids(peer_ids);
 
-        ok(resp).boxed()
+        Box::new(ok(resp))
     }
 
     fn store_heartbeat(&self, stats: pdpb::StoreStats) -> PdFuture<()> {
         if let Err(e) = self.check_bootstrap() {
-            return err(e).boxed();
+            return Box::new(err(e));
         }
 
         // Cache it directly now.
         let store_id = stats.get_store_id();
         self.cluster.wl().store_stats.insert(store_id, stats);
 
-        ok(()).boxed()
+        Box::new(ok(()))
     }
 
     fn report_split(&self, _: metapb::Region, _: metapb::Region) -> PdFuture<()> {
         // pd just uses this for history show, so here we just count it.
         if let Err(e) = self.check_bootstrap() {
-            return err(e).boxed();
+            return Box::new(err(e));
         }
         self.cluster.wl().split_count += 1;
-        ok(()).boxed()
+        Box::new(ok(()))
     }
 }

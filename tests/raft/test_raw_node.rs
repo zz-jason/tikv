@@ -35,7 +35,10 @@ use super::test_raft::*;
 use super::test_raft_paper::*;
 
 fn new_peer(id: u64) -> Peer {
-    Peer { id: id, ..Default::default() }
+    Peer {
+        id: id,
+        ..Default::default()
+    }
 }
 
 fn entry(t: EntryType, term: u64, i: u64, data: Option<Vec<u8>>) -> Entry {
@@ -56,31 +59,36 @@ fn conf_change(t: ConfChangeType, node_id: u64) -> ConfChange {
     cc
 }
 
-fn new_ready(ss: Option<SoftState>,
-             hs: Option<HardState>,
-             entries: Vec<Entry>,
-             committed_entries: Vec<Entry>)
-             -> Ready {
+fn new_ready(
+    ss: Option<SoftState>,
+    hs: Option<HardState>,
+    entries: Vec<Entry>,
+    committed_entries: Vec<Entry>,
+    must_sync: bool,
+) -> Ready {
     Ready {
         ss: ss,
         hs: hs,
         entries: entries,
         committed_entries: Some(committed_entries),
+        must_sync: must_sync,
         ..Default::default()
     }
 }
 
-fn new_raw_node(id: u64,
-                peers: Vec<u64>,
-                election: usize,
-                heartbeat: usize,
-                storage: MemStorage,
-                peer_nodes: Vec<Peer>)
-                -> RawNode<MemStorage> {
-    RawNode::new(&new_test_config(id, peers, election, heartbeat),
-                 storage,
-                 &peer_nodes)
-        .unwrap()
+fn new_raw_node(
+    id: u64,
+    peers: Vec<u64>,
+    election: usize,
+    heartbeat: usize,
+    storage: MemStorage,
+    peer_nodes: Vec<Peer>,
+) -> RawNode<MemStorage> {
+    RawNode::new(
+        &new_test_config(id, peers, election, heartbeat),
+        storage,
+        &peer_nodes,
+    ).unwrap()
 }
 
 // test_raw_node_step ensures that RawNode.Step ignore local message.
@@ -90,11 +98,13 @@ fn test_raw_node_step() {
         let mut raw_node = new_raw_node(1, vec![], 10, 1, new_storage(), vec![new_peer(1)]);
         let res = raw_node.step(new_message(0, 0, *msg_t, 0));
         // local msg should be ignored.
-        if vec![MessageType::MsgBeat,
-                MessageType::MsgHup,
-                MessageType::MsgUnreachable,
-                MessageType::MsgSnapStatus]
-            .contains(msg_t) {
+        if vec![
+            MessageType::MsgBeat,
+            MessageType::MsgHup,
+            MessageType::MsgUnreachable,
+            MessageType::MsgSnapStatus,
+        ].contains(msg_t)
+        {
             assert_eq!(res, Err(Error::StepLocalMsg));
         }
     }
@@ -117,11 +127,12 @@ fn test_raw_node_read_index_to_old_leader() {
     test_entries.set_data(b"testdata".to_vec());
 
     // send readindex request to r2(follower)
-    let _ =
-        nt.peers.get_mut(&2).unwrap().step(new_message_with_entries(2,
-                                                                    2,
-                                                                    MessageType::MsgReadIndex,
-                                                                    vec![test_entries.clone()]));
+    let _ = nt.peers.get_mut(&2).unwrap().step(new_message_with_entries(
+        2,
+        2,
+        MessageType::MsgReadIndex,
+        vec![test_entries.clone()],
+    ));
 
     // verify r2(follower) forwards this message to r1(leader) with term not set
     assert_eq!(nt.peers[&2].msgs.len(), 1);
@@ -130,11 +141,12 @@ fn test_raw_node_read_index_to_old_leader() {
     assert_eq!(read_index_msg1, nt.peers[&2].msgs[0]);
 
     // send readindex request to r3(follower)
-    let _ =
-        nt.peers.get_mut(&3).unwrap().step(new_message_with_entries(3,
-                                                                    3,
-                                                                    MessageType::MsgReadIndex,
-                                                                    vec![test_entries.clone()]));
+    let _ = nt.peers.get_mut(&3).unwrap().step(new_message_with_entries(
+        3,
+        3,
+        MessageType::MsgReadIndex,
+        vec![test_entries.clone()],
+    ));
 
     // verify r3(follower) forwards this message to r1(leader) with term not set as well.
     assert_eq!(nt.peers[&3].msgs.len(), 1);
@@ -178,7 +190,7 @@ fn test_raw_node_propose_and_conf_change() {
         s.wl().append(&rd.entries).expect("");
         // Once we are the leader, propose a command and a ConfChange.
         if !proposed && rd.ss.is_some() && rd.ss.as_ref().unwrap().leader_id == raw_node.raft.id {
-            raw_node.propose(b"somedata".to_vec()).expect("");
+            raw_node.propose(b"somedata".to_vec(), false).expect("");
 
             let cc = conf_change(ConfChangeType::AddNode, 1);
             ccdata = protobuf::Message::write_to_bytes(&cc).unwrap();
@@ -270,7 +282,10 @@ fn test_raw_node_read_index() {
     });
     let wrequest_ctx = b"somedata".to_vec();
     let wrs = vec![
-        ReadState {index: 1u64, request_ctx: wrequest_ctx.clone()},
+        ReadState {
+            index: 1u64,
+            request_ctx: wrequest_ctx.clone(),
+        },
     ];
 
     let s = new_storage();
@@ -290,7 +305,10 @@ fn test_raw_node_read_index() {
     loop {
         let rd = raw_node.ready();
         s.wl().append(&rd.entries).expect("");
-        if rd.ss.as_ref().map_or(false, |ss| ss.leader_id == raw_node.raft.id) {
+        if rd.ss
+            .as_ref()
+            .map_or(false, |ss| ss.leader_id == raw_node.raft.id)
+        {
             raw_node.advance(rd);
 
             // Once we are the leader, issue a read index request
@@ -315,18 +333,26 @@ fn test_raw_node_read_index() {
 fn test_raw_node_start() {
     let cc = conf_change(ConfChangeType::AddNode, 1);
     let ccdata = protobuf::Message::write_to_bytes(&cc).unwrap();
-    let wants = vec![new_ready(None,
-                               Some(hard_state(1, 1, 0)),
-                               vec![
+    let wants = vec![
+        new_ready(
+            None,
+            Some(hard_state(1, 1, 0)),
+            vec![
                 entry(EntryType::EntryConfChange, 1, 1, Some(ccdata.clone())),
             ],
-                               vec![
+            vec![
                 entry(EntryType::EntryConfChange, 1, 1, Some(ccdata.clone())),
-            ]),
-                     new_ready(None,
-                               Some(hard_state(2, 3, 1)),
-                               vec![new_entry(2, 3, Some("foo"))],
-                               vec![new_entry(2, 3, Some("foo"))])];
+            ],
+            true,
+        ),
+        new_ready(
+            None,
+            Some(hard_state(2, 3, 1)),
+            vec![new_entry(2, 3, Some("foo"))],
+            vec![new_entry(2, 3, Some("foo"))],
+            false,
+        ),
+    ];
 
     let store = new_storage();
     let mut raw_node = new_raw_node(1, vec![], 10, 1, store.clone(), vec![new_peer(1)]);
@@ -345,7 +371,7 @@ fn test_raw_node_start() {
     store.wl().append(&rd.entries).expect("");
     raw_node.advance(rd);
 
-    raw_node.propose(b"foo".to_vec()).expect("");
+    raw_node.propose(b"foo".to_vec(), false).expect("");
     let rd = raw_node.ready();
     assert_eq!(rd, wants[1]);
     store.wl().append(&rd.entries).expect("");
@@ -355,13 +381,10 @@ fn test_raw_node_start() {
 
 #[test]
 fn test_raw_node_restart() {
-    let entries = vec![
-        empty_entry(1, 1),
-        new_entry(1, 2, Some("foo")),
-    ];
+    let entries = vec![empty_entry(1, 1), new_entry(1, 2, Some("foo"))];
     let st = hard_state(1, 1, 0);
 
-    let want = new_ready(None, None, vec![], entries[..1].to_vec());
+    let want = new_ready(None, None, vec![], entries[..1].to_vec(), false);
 
     let store = new_storage();
     store.wl().set_hardstate(st);
@@ -379,7 +402,7 @@ fn test_raw_node_restart_from_snapshot() {
     let entries = vec![new_entry(1, 3, Some("foo"))];
     let st = hard_state(1, 3, 0);
 
-    let want = new_ready(None, None, vec![], entries.clone());
+    let want = new_ready(None, None, vec![], entries.clone(), false);
 
     let s = new_storage();
     s.wl().set_hardstate(st);
@@ -429,4 +452,14 @@ fn test_skip_bcast_commit() {
     assert_eq!(nt.peers[&1].raft_log.committed, 4);
     assert_eq!(nt.peers[&2].raft_log.committed, 3);
     assert_eq!(nt.peers[&3].raft_log.committed, 3);
+
+    // When committing conf change, leader should always bcast commit.
+    let mut cc_entry = Entry::new();
+    cc_entry.set_entry_type(EntryType::EntryConfChange);
+    nt.send(vec![
+        new_message_with_entries(1, 1, MessageType::MsgPropose, vec![cc_entry]),
+    ]);
+    assert_eq!(nt.peers[&1].raft_log.committed, 5);
+    assert_eq!(nt.peers[&2].raft_log.committed, 5);
+    assert_eq!(nt.peers[&3].raft_log.committed, 5);
 }

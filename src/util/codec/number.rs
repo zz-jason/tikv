@@ -12,10 +12,10 @@
 // limitations under the License.
 
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{self, ErrorKind, Write, Read};
+use std::io::{self, ErrorKind, Read, Write};
 use std::mem;
 
-use super::{Result, Error};
+use super::{Error, Result};
 
 const SIGN_MARK: u64 = 0x8000000000000000;
 pub const MAX_VAR_I64_LEN: usize = 10;
@@ -91,7 +91,7 @@ pub trait NumberEncoder: Write {
     /// Note that the encoded result is not memcomparable.
     fn encode_var_u64(&mut self, mut v: u64) -> Result<()> {
         while v >= 0x80 {
-            try!(self.write_u8(v as u8 | 0x80));
+            self.write_u8(v as u8 | 0x80)?;
             v >>= 7;
         }
         self.write_u8(v as u8).map_err(From::from)
@@ -126,6 +126,10 @@ pub trait NumberEncoder: Write {
     fn encode_i64_le(&mut self, v: i64) -> Result<()> {
         self.write_i64::<LittleEndian>(v).map_err(From::from)
     }
+
+    fn encode_u64_le(&mut self, v: u64) -> Result<()> {
+        self.write_u64::<LittleEndian>(v).map_err(From::from)
+    }
 }
 
 impl<T: Write> NumberEncoder for T {}
@@ -148,13 +152,13 @@ pub trait NumberDecoder: Read {
 
     /// `decode_u64_desc` decodes value encoded by `encode_u64_desc` before.
     fn decode_u64_desc(&mut self) -> Result<u64> {
-        let v = try!(self.read_u64::<BigEndian>());
+        let v = self.read_u64::<BigEndian>()?;
         Ok(!v)
     }
 
     /// `decode_var_i64` decodes value encoded by `encode_var_i64` before.
     fn decode_var_i64(&mut self) -> Result<i64> {
-        let v = try!(self.decode_var_u64());
+        let v = self.decode_var_u64()?;
         let mut vx = v >> 1;
         if v & 1 != 0 {
             vx = !vx;
@@ -166,10 +170,12 @@ pub trait NumberDecoder: Read {
     fn decode_var_u64(&mut self) -> Result<u64> {
         let (mut x, mut s, mut i) = (0, 0, 0);
         loop {
-            let b = try!(self.read_u8());
+            let b = self.read_u8()?;
             if b < 0x80 {
                 if i > 9 || i == 9 && b > 1 {
-                    return Err(Error::Io(io::Error::new(ErrorKind::InvalidData, "overflow")));
+                    return Err(Error::Io(
+                        io::Error::new(ErrorKind::InvalidData, "overflow"),
+                    ));
                 }
                 return Ok(x | ((b as u64) << s));
             }
@@ -204,6 +210,10 @@ pub trait NumberDecoder: Read {
     fn decode_i64_le(&mut self) -> Result<i64> {
         self.read_i64::<LittleEndian>().map_err(From::from)
     }
+
+    fn decode_u64_le(&mut self) -> Result<u64> {
+        self.read_u64::<LittleEndian>().map_err(From::from)
+    }
 }
 
 impl<T: Read> NumberDecoder for T {}
@@ -213,102 +223,112 @@ mod test {
     use super::*;
     use util::codec::Error;
 
-    use std::{i64, u64, i32, u32, i16, u16, f64, f32};
+    use std::{f32, f64, i16, i32, i64, u16, u32, u64};
     use protobuf::CodedOutputStream;
     use std::io::ErrorKind;
 
-    const U16_TESTS: &'static [u16] = &[i16::MIN as u16,
-                                        i16::MAX as u16,
-                                        u16::MIN,
-                                        u16::MAX,
-                                        0,
-                                        1,
-                                        2,
-                                        10,
-                                        20,
-                                        63,
-                                        64,
-                                        65,
-                                        127,
-                                        128,
-                                        129,
-                                        255,
-                                        256,
-                                        257,
-                                        1024];
+    const U16_TESTS: &'static [u16] = &[
+        i16::MIN as u16,
+        i16::MAX as u16,
+        u16::MIN,
+        u16::MAX,
+        0,
+        1,
+        2,
+        10,
+        20,
+        63,
+        64,
+        65,
+        127,
+        128,
+        129,
+        255,
+        256,
+        257,
+        1024,
+    ];
 
-    const U32_TESTS: &'static [u32] = &[i32::MIN as u32,
-                                        i32::MAX as u32,
-                                        u32::MIN,
-                                        u32::MAX,
-                                        0,
-                                        1,
-                                        2,
-                                        10,
-                                        20,
-                                        63,
-                                        64,
-                                        65,
-                                        127,
-                                        128,
-                                        129,
-                                        255,
-                                        256,
-                                        257,
-                                        1024];
+    const U32_TESTS: &'static [u32] = &[
+        i32::MIN as u32,
+        i32::MAX as u32,
+        u32::MIN,
+        u32::MAX,
+        0,
+        1,
+        2,
+        10,
+        20,
+        63,
+        64,
+        65,
+        127,
+        128,
+        129,
+        255,
+        256,
+        257,
+        1024,
+    ];
 
-    const U64_TESTS: &'static [u64] = &[i64::MIN as u64,
-                                        i64::MAX as u64,
-                                        u64::MIN,
-                                        u64::MAX,
-                                        0,
-                                        1,
-                                        2,
-                                        10,
-                                        20,
-                                        63,
-                                        64,
-                                        65,
-                                        127,
-                                        128,
-                                        129,
-                                        255,
-                                        256,
-                                        257,
-                                        1024];
-    const I64_TESTS: &'static [i64] = &[i64::MIN,
-                                        i64::MAX,
-                                        u64::MIN as i64,
-                                        u64::MAX as i64,
-                                        -1,
-                                        0,
-                                        1,
-                                        2,
-                                        10,
-                                        20,
-                                        63,
-                                        64,
-                                        65,
-                                        127,
-                                        128,
-                                        129,
-                                        255,
-                                        256,
-                                        257,
-                                        1024,
-                                        -1023];
+    const U64_TESTS: &'static [u64] = &[
+        i64::MIN as u64,
+        i64::MAX as u64,
+        u64::MIN,
+        u64::MAX,
+        0,
+        1,
+        2,
+        10,
+        20,
+        63,
+        64,
+        65,
+        127,
+        128,
+        129,
+        255,
+        256,
+        257,
+        1024,
+    ];
+    const I64_TESTS: &'static [i64] = &[
+        i64::MIN,
+        i64::MAX,
+        u64::MIN as i64,
+        u64::MAX as i64,
+        -1,
+        0,
+        1,
+        2,
+        10,
+        20,
+        63,
+        64,
+        65,
+        127,
+        128,
+        129,
+        255,
+        256,
+        257,
+        1024,
+        -1023,
+    ];
 
-    const F64_TESTS: &'static [f64] = &[-1.0,
-                                        0.0,
-                                        1.0,
-                                        f64::MAX,
-                                        f64::MIN,
-                                        f32::MAX as f64,
-                                        f32::MIN as f64,
-                                        f64::MIN_POSITIVE,
-                                        f32::MIN_POSITIVE as f64,
-                                        f64::INFINITY,
-                                        f64::NEG_INFINITY];
+    const F64_TESTS: &'static [f64] = &[
+        -1.0,
+        0.0,
+        1.0,
+        f64::MAX,
+        f64::MIN,
+        f32::MAX as f64,
+        f32::MIN as f64,
+        f64::MIN_POSITIVE,
+        f32::MIN_POSITIVE as f64,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
 
     // use macro to generate order tests for number codecs.
     macro_rules! test_order {
@@ -364,19 +384,32 @@ mod test {
     test_codec!(encode_i64_desc, decode_i64_desc, |a, b| b.cmp(a), I64_TESTS);
     test_codec!(encode_u64, decode_u64, |a, b| a.cmp(b), U64_TESTS);
     test_codec!(encode_u64_desc, decode_u64_desc, |a, b| b.cmp(a), U64_TESTS);
-    test_codec!(encode_f64,
-                decode_f64,
-                |a, b| a.partial_cmp(b).unwrap(),
-                F64_TESTS);
-    test_codec!(encode_f64_desc,
-                decode_f64_desc,
-                |a, b| b.partial_cmp(a).unwrap(),
-                F64_TESTS);
+    test_codec!(
+        encode_f64,
+        decode_f64,
+        |a, b| a.partial_cmp(b).unwrap(),
+        F64_TESTS
+    );
+    test_codec!(
+        encode_f64_desc,
+        decode_f64_desc,
+        |a, b| b.partial_cmp(a).unwrap(),
+        F64_TESTS
+    );
 
-    test_serialize!(var_i64_little_endian_codec,
-                    encode_i64_le,
-                    decode_i64_le,
-                    I64_TESTS);
+    test_serialize!(
+        var_i64_little_endian_codec,
+        encode_i64_le,
+        decode_i64_le,
+        I64_TESTS
+    );
+
+    test_serialize!(
+        var_u64_little_endian_codec,
+        encode_u64_le,
+        decode_u64_le,
+        U64_TESTS
+    );
 
     test_serialize!(var_u16_codec, encode_u16_le, decode_u16_le, U16_TESTS);
     test_serialize!(var_u32_codec, encode_u32_le, decode_u32_le, U32_TESTS);
