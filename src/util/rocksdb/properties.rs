@@ -28,7 +28,7 @@ use util::codec::number::{NumberDecoder, NumberEncoder};
 
 const PROP_NUM_ERRORS: &'static str = "tikv.num_errors";
 const PROP_MIN_TS: &'static str = "tikv.min_ts";
-const PROP_MAX_TS: &'static str = "tikv.max_ts";
+pub const PROP_MAX_TS: &'static str = "tikv.max_ts";
 const PROP_NUM_ROWS: &'static str = "tikv.num_rows";
 const PROP_NUM_PUTS: &'static str = "tikv.num_puts";
 const PROP_NUM_VERSIONS: &'static str = "tikv.num_versions";
