@@ -1167,7 +1167,8 @@ impl ApplyDelegate {
             });
 
         // Delete all remaining keys.
-        util::delete_all_in_range_cf(&self.engine, cf, &start_key, &end_key).unwrap_or_else(|e| {
+        info!("{} skip scan delete range [{}, {}), cf: {} for now.", self.tag, escape(&start_key), escape(&end_key), cf);
+        /*util::delete_all_in_range_cf(&self.engine, cf, &start_key, &end_key).unwrap_or_else(|e| {
             panic!(
                 "{} failed to delete all in range [{}, {}), cf: {}, err: {:?}",
                 self.tag,
@@ -1176,7 +1177,7 @@ impl ApplyDelegate {
                 cf,
                 e
             );
-        });
+        });*/
 
         ranges.push(Range::new(cf.to_owned(), start_key, end_key));
 
